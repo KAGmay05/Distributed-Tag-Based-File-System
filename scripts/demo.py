@@ -7,7 +7,7 @@ import os
 import time
 
 from tagfs.query import matches, parse_query
-from tagfs.ray_runtime import run_in_workers, start_cluster, stop_cluster
+from tagfs.ray_runtime import ActorProxy, run_in_workers, start_cluster, stop_cluster
 from tagfs.router import shard_for
 
 CLIENTS = 4
@@ -43,7 +43,8 @@ def print_processes(cluster, results):
         print(f"  MetadataShard {index}: {shard.pid()}")
     for index, shard in enumerate(cluster.tags):
         print(f"  TagShard {index}: {shard.pid()}")
-    print(f"  FakeContentStore: {cluster.content.pid()}")
+    for name, node in cluster.storage.items():
+        print(f"  StorageNode {name}: {ActorProxy(node).pid()}")
     for index, result in enumerate(results):
         print(f"  cliente {index}: {result['pid']}")
 

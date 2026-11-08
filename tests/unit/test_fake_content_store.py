@@ -2,8 +2,8 @@ import hashlib
 
 import pytest
 
-from tagfs.content_store import FakeContentStore
-from tagfs.model import ContentNotFound
+from tagfs.content import ContentNotFound
+from tagfs.fake_content_store import FakeContentStore
 
 
 def test_put_returns_the_sha256_of_the_content():

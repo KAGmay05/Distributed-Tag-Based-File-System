@@ -1,10 +1,11 @@
 import pytest
 from gateway_contract import GatewayContract
 
-from tagfs.content_store import FakeContentStore
+from tagfs.content import ContentCorrupted
+from tagfs.fake_content_store import FakeContentStore
 from tagfs.gateway import Gateway
 from tagfs.metadata_shard import MetadataShard
-from tagfs.model import ContentIntegrityError, InvalidTag
+from tagfs.model import InvalidTag
 from tagfs.router import shard_for
 from tagfs.tag_shard import TagShard
 
@@ -65,7 +66,7 @@ def test_invalid_tag_fails_before_storing_content():
 def test_wrong_hash_from_store_stops_put_before_metadata():
     gateway, _, _ = build_gateway(WrongHashStore())
 
-    with pytest.raises(ContentIntegrityError):
+    with pytest.raises(ContentCorrupted):
         gateway.put("a.txt", b"x", {"doc"})
 
     assert gateway.list() == []
@@ -75,7 +76,7 @@ def test_get_detects_corrupted_content():
     gateway, _, _ = build_gateway(CorruptingStore())
     file_id = gateway.put("a.txt", b"x", {"doc"})
 
-    with pytest.raises(ContentIntegrityError):
+    with pytest.raises(ContentCorrupted):
         gateway.get(file_id)
 
 

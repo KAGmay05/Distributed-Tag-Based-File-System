@@ -22,14 +22,6 @@ class FileIdConflict(TagFSError):
     """El ID ya se usó con otros datos; los IDs nunca se reutilizan."""
 
 
-class ContentNotFound(TagFSError):
-    """El almacén no tiene contenido con ese hash."""
-
-
-class ContentIntegrityError(TagFSError):
-    """El contenido no coincide con su hash."""
-
-
 class InvalidTag(TagFSError, ValueError):
     """La etiqueta no se podría escribir en una consulta."""
 

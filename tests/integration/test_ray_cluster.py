@@ -10,12 +10,13 @@ import time
 
 import pytest
 
-pytest.importorskip("ray")
+ray = pytest.importorskip("ray")
 
 from gateway_contract import GatewayContract  # noqa: E402
 
+from tagfs.content import content_hash  # noqa: E402
 from tagfs.gateway import Gateway  # noqa: E402
-from tagfs.ray_runtime import run_in_workers, start_cluster, stop_cluster  # noqa: E402
+from tagfs.ray_runtime import ActorProxy, run_in_workers, start_cluster, stop_cluster  # noqa: E402
 from tagfs.router import shard_for  # noqa: E402
 
 CLIENTS = 4
@@ -47,11 +48,22 @@ class TestRayGateway(GatewayContract):
 
 
 def test_each_actor_runs_in_its_own_process(cluster):
-    pids = [actor.pid() for actor in (*cluster.metadata, *cluster.tags, cluster.content)]
+    storage = [ActorProxy(node) for node in cluster.storage.values()]
+    pids = [actor.pid() for actor in (*cluster.metadata, *cluster.tags, *storage)]
 
-    assert len(pids) == 9
-    assert len(set(pids)) == 9
+    assert len(pids) == 11
+    assert len(set(pids)) == 11
     assert os.getpid() not in pids
+
+
+def test_get_survives_the_death_of_a_storage_node(cluster):
+    gateway = cluster.gateway()
+    file_id = gateway.put("a.txt", b"contenido", {"doc"})
+    replicas = cluster.content_store().replicas(content_hash(b"contenido"))
+
+    ray.kill(cluster.storage[replicas[0]])
+
+    assert gateway.get(file_id)[1] == b"contenido"
 
 
 def test_concurrent_clients_lose_no_files(cluster):
@@ -94,7 +106,7 @@ def test_concurrent_tag_changes_on_one_file_stay_consistent(cluster):
                     super()._deliver([op])
 
         started = time.time()
-        gateway = DelayedGateway(cluster.metadata, cluster.tags, cluster.content)
+        gateway = DelayedGateway(cluster.metadata, cluster.tags, cluster.content_store())
         versions = []
         # Cada ronda es una carrera aparte por su propia etiqueta, entre clientes que la
         # agregan y clientes que la quitan. Si todos compitieran por la misma etiqueta,

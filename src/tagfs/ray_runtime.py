@@ -1,7 +1,8 @@
-"""Adaptador de Ray: el único archivo del proyecto que importa Ray.
+"""Monta el sistema sobre Ray.
 
-Convierte las clases normales en actores sin modificarlas y hace que el gateway
-los use como si fueran objetos locales.
+Las clases de lógica (MetadataShard, TagShard, StorageNode) no importan Ray.
+Ray aparece solo en dos adaptadores: este archivo, que convierte las clases en
+actores, y content_store.py, que reparte el contenido entre los StorageNode.
 """
 
 from __future__ import annotations
@@ -13,13 +14,17 @@ from typing import Any, Callable, Iterable
 
 import ray
 
-from tagfs.content_store import FakeContentStore
+import tagfs
+from tagfs.content_store import ContentStore
 from tagfs.gateway import Gateway
 from tagfs.metadata_shard import MetadataShard
+from tagfs.storage_node import StorageNode
 from tagfs.tag_shard import TagShard
 
 METADATA_SHARDS = 4
 TAG_SHARDS = 4
+STORAGE_NODES = 3
+REPLICATION_FACTOR = 2
 WORKER_START_TIMEOUT_SECONDS = 120
 
 
@@ -39,7 +44,7 @@ class _TagShardActor(_ProcessInfo, TagShard):
 
 
 @ray.remote
-class _ContentStoreActor(_ProcessInfo, FakeContentStore):
+class _StorageNodeActor(_ProcessInfo, StorageNode):
     pass
 
 
@@ -64,22 +69,44 @@ class RayCluster:
 
     metadata: tuple[ActorProxy, ...]
     tags: tuple[ActorProxy, ...]
-    content: ActorProxy
+    # Handles directos, sin ActorProxy: ContentStore llama a varios nodos a la vez.
+    storage: dict[str, Any]
+    replication_factor: int = REPLICATION_FACTOR
+
+    def content_store(self) -> ContentStore:
+        # Cada cliente crea el suyo, que habla directamente con los StorageNode.
+        # Un ContentStore compartido en un actor sería un cuello de botella y, si ese
+        # actor muriera, nadie podría leer ni escribir contenido.
+        return ContentStore(self.storage, self.replication_factor)
 
     def gateway(self) -> Gateway:
-        return Gateway(self.metadata, self.tags, self.content)
+        return Gateway(self.metadata, self.tags, self.content_store())
 
 
 def start_cluster(
-    metadata_shards: int = METADATA_SHARDS, tag_shards: int = TAG_SHARDS
+    metadata_shards: int = METADATA_SHARDS,
+    tag_shards: int = TAG_SHARDS,
+    storage_nodes: int = STORAGE_NODES,
+    replication_factor: int = REPLICATION_FACTOR,
 ) -> RayCluster:
     """Crea los actores. Viven mientras se conserve el RayCluster devuelto."""
     if not ray.is_initialized():
-        ray.init(include_dashboard=False, logging_level="ERROR")
+        # py_modules envía el paquete a los workers: así no dependen de que tagfs
+        # esté instalado en su máquina.
+        ray.init(
+            include_dashboard=False,
+            logging_level="ERROR",
+            runtime_env={"py_modules": [tagfs]},
+        )
+    storage = {f"storage-{i}": _StorageNodeActor.remote() for i in range(storage_nodes)}
+    # ContentStore descarta un nodo que no responde dentro de su timeout. Un actor
+    # recién creado puede tardar en arrancar, así que se espera a que todos respondan.
+    ray.get([node.pid.remote() for node in storage.values()])
     return RayCluster(
         metadata=tuple(ActorProxy(_MetadataShardActor.remote()) for _ in range(metadata_shards)),
         tags=tuple(ActorProxy(_TagShardActor.remote()) for _ in range(tag_shards)),
-        content=ActorProxy(_ContentStoreActor.remote()),
+        storage=storage,
+        replication_factor=replication_factor,
     )
 
 

@@ -3,20 +3,32 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Iterable, Sequence
+from typing import Iterable, Protocol, Sequence
 from uuid import uuid4
 
-from tagfs.content_store import ContentStore, content_hash
+from tagfs.content import ContentCorrupted, content_hash
 from tagfs.metadata_shard import MetadataShard
-from tagfs.model import ContentIntegrityError, FileId, FileMeta, IndexOp, normalize_tags
+from tagfs.model import FileId, FileMeta, IndexOp, normalize_tags
 from tagfs.query import candidates, matches, parse_query
 from tagfs.router import shard_for
 from tagfs.tag_shard import TagShard
 
 
+class ContentAPI(Protocol):
+    """Lo que el gateway necesita del almacén de contenido."""
+
+    def put(self, content: bytes) -> str:
+        """Guarda los bytes y devuelve su sha256 en hexadecimal."""
+        ...
+
+    def get(self, content_hash: str) -> bytes:
+        """Devuelve los bytes de ese hash o lanza ContentNotFound."""
+        ...
+
+
 def _verify(content: bytes, expected_hash: str) -> None:
     if content_hash(content) != expected_hash:
-        raise ContentIntegrityError(expected_hash)
+        raise ContentCorrupted(expected_hash)
 
 
 class Gateway:
@@ -30,7 +42,7 @@ class Gateway:
         self,
         metadata: Sequence[MetadataShard],
         tags: Sequence[TagShard],
-        content: ContentStore,
+        content: ContentAPI,
     ) -> None:
         self._metadata = metadata
         self._tags = tags
