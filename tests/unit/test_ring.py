@@ -19,9 +19,8 @@ def test_same_key_always_gets_the_same_nodes():
 
 
 def test_replicas_are_on_different_nodes():
-    nodes = make_ring("A", "B", "C").nodes_for("9b2e", 2)
-    assert len(nodes) == 2
-    assert len(set(nodes)) == 2
+    ring = make_ring("A", "B", "C")
+    assert all(len(set(ring.nodes_for(key, 2))) == 2 for key in KEYS)
 
 
 def test_asking_for_too_many_replicas_returns_every_node():

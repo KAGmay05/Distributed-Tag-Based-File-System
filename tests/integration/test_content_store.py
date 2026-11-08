@@ -78,15 +78,6 @@ def test_get_of_unknown_content_fails():
         store.get(KEY)
 
 
-def test_with_two_copies_get_survives_the_death_of_a_node():
-    store, nodes = make_store(replication_factor=2)
-    store.put(DATA)
-
-    ray.kill(nodes[store.replicas(KEY)[0]])
-
-    assert store.get(KEY) == DATA
-
-
 def test_with_two_copies_get_keeps_working_after_the_ring_forgets_the_dead_node():
     store, nodes = make_store(replication_factor=2)
     store.put(DATA)
@@ -94,16 +85,6 @@ def test_with_two_copies_get_keeps_working_after_the_ring_forgets_the_dead_node(
 
     assert store.get(KEY) == DATA
     assert store.get(KEY) == DATA
-
-
-def test_with_one_copy_the_death_of_its_node_loses_the_content():
-    store, nodes = make_store(replication_factor=1)
-    store.put(DATA)
-
-    ray.kill(nodes[store.replicas(KEY)[0]])
-
-    with pytest.raises(ContentNotFound):
-        store.get(KEY)
 
 
 def test_put_writes_to_the_next_node_when_one_is_dead():

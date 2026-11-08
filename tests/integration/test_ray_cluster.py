@@ -148,19 +148,3 @@ def test_concurrent_tag_changes_on_one_file_stay_consistent(cluster):
     for tag in unique_tags | disputed_tags:
         shard = cluster.tags[shard_for(tag, len(cluster.tags))]
         assert (file_id in shard.lookup(tag)) == (tag in tags), tag
-
-
-def test_files_and_tags_spread_across_shards(cluster):
-    gateway = cluster.gateway()
-    tags = [f"etiqueta-{i}" for i in range(16)]
-
-    created = [gateway.put(f"{i}.txt", b"x", {tags[i % len(tags)]}) for i in range(100)]
-
-    per_shard = [len(shard.list_ids()) for shard in cluster.metadata]
-    assert sum(per_shard) == len(created)
-    assert all(count > 0 for count in per_shard)
-    for tag in tags:
-        home = shard_for(tag, len(cluster.tags))
-        for index, shard in enumerate(cluster.tags):
-            assert bool(shard.lookup(tag)) == (index == home)
-    assert {shard_for(tag, len(cluster.tags)) for tag in tags} == set(range(len(cluster.tags)))

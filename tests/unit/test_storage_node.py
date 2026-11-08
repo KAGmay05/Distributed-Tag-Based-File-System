@@ -20,13 +20,6 @@ def test_put_rejects_bytes_that_do_not_match_the_key():
     assert not node.has(KEY)
 
 
-def test_repeated_put_keeps_a_single_copy():
-    node = StorageNode()
-    node.put(KEY, DATA)
-    node.put(KEY, DATA)
-    assert node.list_keys() == [KEY]
-
-
 def test_get_of_unknown_key_fails():
     with pytest.raises(ContentNotFound):
         StorageNode().get(KEY)

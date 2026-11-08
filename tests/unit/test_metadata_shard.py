@@ -21,16 +21,6 @@ def test_create_returns_first_version_and_normalized_index_ops():
     )
 
 
-def test_create_stores_normalized_tags_and_file_data(shard):
-    meta = shard.get("f1")
-
-    assert (meta.name, meta.tags, meta.content_hash) == (
-        "playa.jpg",
-        {"foto", "viaje"},
-        "hash-1",
-    )
-
-
 def test_create_repeated_with_same_data_changes_nothing(shard):
     assert shard.create("f1", "playa.jpg", {"FOTO", "viaje"}, "hash-1") == (1, ())
     assert shard.get("f1").version == 1

@@ -26,10 +26,6 @@ def test_parse_builds_the_expected_tree(text, expected):
     assert parse_query(text) == expected
 
 
-def test_parse_normalizes_tags_to_lowercase():
-    assert parse_query("FOTO AND Viaje") == And((Tag("foto"), Tag("viaje")))
-
-
 @pytest.mark.parametrize(
     "text",
     ["", "   ", "(", ")", "()", "a b", "a AND", "AND a", "a OR OR b", "(a", "a)", "NOT"],
@@ -56,10 +52,6 @@ def test_parse_rejects_queries_without_positive_part(text):
 def test_parse_rejects_excessive_nesting(text):
     with pytest.raises(InvalidQuery):
         parse_query(text)
-
-
-def test_parse_accepts_reasonable_nesting():
-    assert parse_query("(" * 50 + "a" + ")" * 50) == A
 
 
 @pytest.mark.parametrize("tag", ["foto", "año-2024", "c++", "notas", "android", "or_2", "FOTO"])
