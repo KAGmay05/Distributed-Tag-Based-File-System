@@ -6,6 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "tagfs"
 version = "0.1.0"
 requires-python = ">=3.10"
+dependencies = ["ray==2.60.0"]
+
+[project.optional-dependencies]
+test = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -3,7 +3,7 @@ from gateway_contract import GatewayContract
 
 from tagfs.content import ContentCorrupted
 from tagfs.fake_content_store import FakeContentStore
-from tagfs.gateway import Gateway
+from tagfs.gateway import Gateway, StoredFile
 from tagfs.metadata_shard import MetadataShard
 from tagfs.model import InvalidTag
 from tagfs.router import shard_for
@@ -130,3 +130,26 @@ def test_query_filters_stale_index_entries_with_metadata():
     metadata[shard_for(file_id, len(metadata))].remove_tags(file_id, {"doc"})
 
     assert gateway.query("doc") == []
+
+
+def test_stored_file_supports_attributes_and_tuple_access():
+    gateway, _, _ = build_gateway()
+    file_id = gateway.put("a.txt", b"x")
+
+    stored = gateway.get(file_id)
+
+    assert isinstance(stored, StoredFile)
+    assert stored.name == stored[0] == "a.txt"
+    assert stored.content == stored[1] == b"x"
+    assert stored.tags == frozenset()
+
+
+@pytest.mark.parametrize("metadata,tags", [([], [TagShard()]), ([MetadataShard()], [])])
+def test_gateway_rejects_empty_injected_shards(metadata, tags):
+    with pytest.raises(ValueError):
+        Gateway(metadata, tags, FakeContentStore())
+
+
+def test_gateway_rejects_partial_dependencies():
+    with pytest.raises(ValueError):
+        Gateway(metadata=[MetadataShard()])

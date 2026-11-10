@@ -16,7 +16,7 @@ from gateway_contract import GatewayContract  # noqa: E402
 
 from tagfs.content import content_hash  # noqa: E402
 from tagfs.gateway import Gateway  # noqa: E402
-from tagfs.ray_runtime import ActorProxy, run_in_workers, start_cluster, stop_cluster  # noqa: E402
+from tagfs.ray_runtime import ActorProxy, run_in_workers, start_cluster  # noqa: E402
 from tagfs.router import shard_for  # noqa: E402
 
 CLIENTS = 4
@@ -28,12 +28,6 @@ ROUND_SECONDS = 0.04
 def assert_ran_at_the_same_time(spans):
     started, finished = zip(*spans)
     assert max(started) < min(finished), "los clientes no coincidieron en el tiempo"
-
-
-@pytest.fixture(scope="module", autouse=True)
-def ray_session():
-    yield
-    stop_cluster()
 
 
 @pytest.fixture

@@ -1,119 +1,233 @@
-"""Demo: varios clientes usan el sistema a la vez sobre actores de Ray.
+"""Demostración del sistema completo: operaciones, eliminación, fallos,
+particiones y concurrencia.
 
-Uso: python scripts/demo.py
+Uso, desde la raíz del proyecto:  python scripts/demo.py
 """
 
+from __future__ import annotations
+
 import os
+import sys
 import time
+from pathlib import Path
 
-from tagfs.query import matches, parse_query
-from tagfs.ray_runtime import ActorProxy, run_in_workers, start_cluster, stop_cluster
-from tagfs.router import shard_for
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.stdout.reconfigure(encoding="utf-8")  # la consola de Windows no siempre usa UTF-8
+# Al leer, se usa la primera réplica que responde y las demás respuestas no se leen.
+# Si alguna era de un almacén aislado, Ray la imprimiría como error sin atender.
+os.environ.setdefault("RAY_IGNORE_UNHANDLED_ERRORS", "1")
 
-CLIENTS = 4
-FILES_PER_CLIENT = 25
-KINDS = ["foto", "video", "doc"]
-YEARS = ["2023", "2024"]
-DRAFT = "borrador"
-QUERIES = [
-    "foto",
-    "foto AND 2024",
-    "foto OR video",
-    "(foto OR video) AND 2024 AND NOT borrador",
-]
+import ray  # noqa: E402
+
+from tagfs.content import ContentNotFound, NodeUnreachable, content_hash  # noqa: E402
+from tagfs.gateway import Gateway, start_gateway, start_ray  # noqa: E402
+
+CLIENTS = 50
 
 
-def client(cluster, client_id):
+def title(text: str) -> None:
+    print(f"\n{'=' * 64}\n {text}\n{'=' * 64}")
+
+
+def step(text: str) -> None:
+    print(f"\n>>> {text}")
+
+
+def show(label: str, value: object) -> None:
+    print(f"    {label:<42} {value}")
+
+
+def copies(gateway: Gateway, content: bytes) -> int:
+    """Cuántos almacenes vivos guardan ese contenido."""
+    count = 0
+    for node in gateway._storage.values():
+        try:
+            count += ray.get(node.has.remote(content_hash(content)), timeout=10)
+        except (ray.exceptions.RayActorError, NodeUnreachable):
+            pass
+    return count
+
+
+def misplaced(gateway: Gateway) -> int:
+    """Cuántos contenidos vivos no están exactamente en las réplicas que dice el anillo."""
+    count = 0
+    for meta in gateway._live_files():
+        key = meta.content_hash
+        holders = {name for name, node in gateway._storage.items() if ray.get(node.has.remote(key))}
+        count += holders != set(gateway._content.replicas(key))
+    return count
+
+
+def names(gateway: Gateway, file_ids: list[str]) -> str:
+    return ", ".join(gateway.get(file_id).name for file_id in file_ids) or "(ninguno)"
+
+
+def readable(gateway: Gateway, file_ids: list[str]) -> int:
+    count = 0
+    for file_id in file_ids:
+        try:
+            gateway.get(file_id)
+            count += 1
+        except ContentNotFound:
+            pass
+    return count
+
+
+def demo_operations(gateway: Gateway) -> None:
+    title("1. Guardar archivos con etiquetas")
+    files = {
+        "playa.jpg": (b"foto de la playa", {"foto", "viaje", "2024"}),
+        "copia-playa.jpg": (b"foto de la playa", {"foto", "backup"}),
+        "montana.jpg": (b"foto de la montana", {"foto", "viaje", "2023"}),
+        "cumple.mp4": (b"video del cumple", {"video", "familia", "2024"}),
+        "informe.pdf": (b"informe trimestral", {"trabajo", "2024", "borrador"}),
+        "cancion.mp3": (b"una cancion", {"musica"}),
+    }
+    ids = {}
+    for name, (content, tags) in files.items():
+        ids[name] = gateway.put(name, content, tags)
+        show(name, f"id {ids[name][:8]}...  etiquetas: {', '.join(sorted(tags))}")
+    show("Archivos en el sistema (list)", len(gateway.list()))
+    show("Copias de 'foto de la playa' (2 archivos)", copies(gateway, b"foto de la playa"))
+    print("    → el mismo contenido se guarda una sola vez, en 2 almacenes")
+
+    title("2. Leer un archivo")
+    stored = gateway.get(ids["playa.jpg"])
+    show("Nombre", stored.name)
+    show("Contenido", stored.content)
+    show("Etiquetas", ", ".join(sorted(stored.tags)))
+    show("Versión", stored.version)
+
+    title("3. Buscar por combinaciones de etiquetas")
+    for expr in [
+        "foto",
+        "foto AND viaje",
+        "foto AND NOT 2023",
+        "video OR musica",
+        "2024 AND NOT borrador",
+        "(foto OR video) AND 2024",
+    ]:
+        show(expr, names(gateway, gateway.query(expr)))
+
+    title("4. Modificar etiquetas y nombre (cada cambio sube la versión)")
+    show("add_tags(informe.pdf, final)", f"versión {gateway.add_tags(ids['informe.pdf'], {'final'})}")
+    show("remove_tags(informe.pdf, borrador)", f"versión {gateway.remove_tags(ids['informe.pdf'], {'borrador'})}")
+    show("rename(montana.jpg → cordillera.jpg)", f"versión {gateway.rename(ids['montana.jpg'], 'cordillera.jpg')}")
+    show("add_tags(informe.pdf, final) otra vez", f"versión {gateway.add_tags(ids['informe.pdf'], {'final'})}  (sin cambios)")
+    show("2024 AND NOT borrador", names(gateway, gateway.query("2024 AND NOT borrador")))
+    show("foto AND viaje", names(gateway, gateway.query("foto AND viaje")))
+
+    title("5. Eliminar y recolectar basura")
+    step("Se elimina playa.jpg, que comparte contenido con copia-playa.jpg")
+    gateway.delete(ids["playa.jpg"])
+    show("Recolección de basura: contenidos borrados", gateway.collect_garbage())
+    show("Copias de 'foto de la playa'", copies(gateway, b"foto de la playa"))
+    show("copia-playa.jpg se sigue leyendo", gateway.get(ids["copia-playa.jpg"]).content)
+    step("Se elimina copia-playa.jpg: ya nadie usa ese contenido")
+    gateway.delete(ids["copia-playa.jpg"])
+    show("Recolección de basura: contenidos borrados", gateway.collect_garbage())
+    show("Copias de 'foto de la playa'", copies(gateway, b"foto de la playa"))
+    show("Archivos en el sistema (list)", len(gateway.list()))
+
+
+def demo_failures(gateway: Gateway) -> None:
+    title("6. Se cae un almacén (2 copias de cada contenido)")
+    ids = [gateway.put(f"archivo-{i}.txt", f"contenido {i}".encode(), {"lote"}) for i in range(20)]
+    victim = gateway._content.replicas(content_hash(b"contenido 0"))[0]
+    show("Archivos guardados", len(ids))
+    step(f"Se apaga el almacén {victim}")
+    ray.kill(gateway._storage[victim])
+    show("Archivos que se pueden leer", f"{readable(gateway, ids)} de {len(ids)}")
+    new = gateway.put("despues.txt", b"escrito con un almacen caido", {"lote"})
+    show("Archivo nuevo, copias guardadas", copies(gateway, b"escrito con un almacen caido"))
+    show("Se lee el archivo nuevo", gateway.get(new).content)
+
+    title("7. Lo mismo, pero con 1 sola copia de cada contenido")
+    single = Gateway(replication_factor=1)
+    ids = [single.put(f"archivo-{i}.txt", f"contenido {i}".encode(), {"lote"}) for i in range(20)]
+    victim = single._content.replicas(content_hash(b"contenido 0"))[0]
+    show("Archivos guardados", len(ids))
+    step(f"Se apaga el almacén {victim}")
+    ray.kill(single._storage[victim])
+    lost = len(ids) - readable(single, ids)
+    show("Archivos que se pueden leer", f"{len(ids) - lost} de {len(ids)}")
+    show("Archivos cuyo contenido se perdió", lost)
+    show("Sus fichas siguen existiendo (list)", len(single.list()))
+    print("    → con una sola copia, perder un almacén pierde contenido")
+
+    title("8. Se cae una sección del índice de etiquetas")
+    show("Antes: archivos con 'lote'", len(gateway.query("lote")))
+    step("Se apaga la sección del índice que guarda 'lote'")
+    ray.kill(gateway._tag_shard_for("lote"))
+    show("Después: archivos con 'lote'", len(gateway.query("lote")))
+    print("    → la sección se reconstruyó a partir de las fichas")
+
+
+def demo_partition() -> None:
+    title("9. Partición de red: un almacén queda aislado y después vuelve")
+    gateway = Gateway()
+    before = [gateway.put(f"antes-{i}.txt", f"antes {i}".encode(), {"red"}) for i in range(10)]
+    isolated = gateway._content.replicas(content_hash(b"antes 0"))[0]
+    show("Archivos guardados antes de la partición", len(before))
+
+    step(f"Se aísla {isolated}: sigue vivo y con sus datos, pero nadie puede comunicarse con él")
+    ray.get(gateway._storage[isolated].disconnect.remote())
+    during = [gateway.put(f"durante-{i}.txt", f"durante {i}".encode(), {"red"}) for i in range(10)]
+    gateway.delete(before.pop(0))
+    show("Archivos guardados durante la partición", len(during))
+    show("Archivo eliminado y basura recolectada", gateway.collect_garbage())
+    show("Archivos que se pueden leer", f"{readable(gateway, before + during)} de {len(before + during)}")
+
+    step(f"Vuelve la comunicación con {isolated}")
+    ray.get(gateway._storage[isolated].reconnect.remote())
+    show("Contenidos fuera de su lugar", misplaced(gateway))
+    show(f"¿{isolated} todavía guarda el contenido borrado?", copies(gateway, b"antes 0") > 0)
+
+    step("Reconciliación")
+    report = gateway.reconcile()
+    show("Almacenes readmitidos en el anillo", ", ".join(report.rejoined) or "(ninguno)")
+    show("Copias escritas donde faltaban", report.copied)
+    show("Copias sobrantes borradas", report.removed)
+    show("Contenidos borrados por ser basura", report.garbage)
+    show("Contenidos fuera de su lugar", misplaced(gateway))
+    show(f"¿{isolated} todavía guarda el contenido borrado?", copies(gateway, b"antes 0") > 0)
+    print("    → todo quedó como si la partición no hubiera ocurrido")
+
+
+def add_tag(gateway, file_id: str, tag: str) -> int:
+    return ray.get(gateway.add_tags.remote(file_id, {tag}))
+
+
+def demo_concurrency() -> None:
+    title(f"10. {CLIENTS} clientes cambian el mismo archivo a la vez")
+    gateway = start_gateway()
+    file_id = ray.get(gateway.put.remote("compartido.txt", b"archivo compartido", set()))
+    remote_add = ray.remote(add_tag)
     started = time.time()
-    gateway = cluster.gateway()
-    created = []
-    for i in range(FILES_PER_CLIENT):
-        tags = {KINDS[i % len(KINDS)], YEARS[i % len(YEARS)]}
-        if i % 5 == 0:
-            tags.add(DRAFT)
-        content = f"cliente {client_id}, archivo {i}".encode()
-        created.append(gateway.put(f"cliente{client_id}-{i}.dat", content, tags))
-    return {"pid": os.getpid(), "started": started, "finished": time.time(), "created": created}
+    versions = ray.get([remote_add.remote(gateway, file_id, f"cliente-{i}") for i in range(CLIENTS)])
+    stored = ray.get(gateway.get.remote(file_id))
+    show("Tiempo", f"{time.time() - started:.1f} s")
+    show("Etiquetas finales", f"{len(stored.tags)} de {CLIENTS}")
+    show("Versión final", stored.version)
+    show("Versiones distintas recibidas", f"{len(set(versions))} (de {min(versions)} a {max(versions)})")
+    print("    → ningún cambio se perdió: se aplicaron uno detrás de otro")
 
 
-def print_processes(cluster, results):
-    print("Procesos")
-    print(f"  script de la demo: {os.getpid()}")
-    for index, shard in enumerate(cluster.metadata):
-        print(f"  MetadataShard {index}: {shard.pid()}")
-    for index, shard in enumerate(cluster.tags):
-        print(f"  TagShard {index}: {shard.pid()}")
-    for name, node in cluster.storage.items():
-        print(f"  StorageNode {name}: {ActorProxy(node).pid()}")
-    for index, result in enumerate(results):
-        print(f"  cliente {index}: {result['pid']}")
-
-
-def print_concurrency(results):
-    last_start = max(result["started"] for result in results)
-    first_finish = min(result["finished"] for result in results)
-    total = max(result["finished"] for result in results) - min(r["started"] for r in results)
-    print("\nConcurrencia")
-    print(f"  {CLIENTS} clientes crearon {CLIENTS * FILES_PER_CLIENT} archivos en {total:.2f} s")
-    print(f"  todos activos a la vez durante {max(0, first_finish - last_start):.2f} s")
-
-
-def print_distribution(cluster):
-    print("\nReparto")
-    for index, shard in enumerate(cluster.metadata):
-        print(f"  MetadataShard {index}: {len(shard.list_ids())} archivos")
-    for tag in [*KINDS, *YEARS, DRAFT]:
-        index = shard_for(tag, len(cluster.tags))
-        print(f"  etiqueta {tag!r} en TagShard {index}: {len(cluster.tags[index].lookup(tag))} archivos")
-
-
-def check_queries(cluster, gateway):
-    """Compara cada consulta con el resultado calculado directamente desde los metadatos."""
-    files = []
-    for shard in cluster.metadata:
-        files.extend(shard.get_many(shard.list_ids()).values())
-
-    print("\nConsultas")
-    for text in QUERIES:
-        expr = parse_query(text)
-        expected = sorted(meta.file_id for meta in files if matches(expr, meta.tags))
-        found = gateway.query(text)
-        print(f"  {text}: {len(found)} archivos")
-        if found != expected:
-            raise SystemExit(f"La consulta {text!r} no coincide con los metadatos")
-
-
-def show_operations(gateway):
-    print("\nOperaciones")
-    file_id = gateway.put("nota.txt", b"hola", {"Demo"})
-    print(f"  put: {file_id}")
-    print(f"  get: {gateway.get(file_id)}")
-    print(f"  add_tags: version {gateway.add_tags(file_id, {'urgente'})}")
-    print(f"  remove_tags: version {gateway.remove_tags(file_id, {'demo'})}")
-    print(f"  rename: version {gateway.rename(file_id, 'nota-final.txt')}")
-    print(f"  get: {gateway.get(file_id)}")
-    print(f"  query('urgente'): {gateway.query('urgente')}")
-    gateway.delete(file_id)
-    print(f"  delete, y luego query('urgente'): {gateway.query('urgente')}")
-
-
-def main():
-    cluster = start_cluster()
-    results = run_in_workers(client, [(cluster, i) for i in range(CLIENTS)])
-
-    gateway = cluster.gateway()
-    created = [file_id for result in results for file_id in result["created"]]
-    if gateway.list() != sorted(created):
-        raise SystemExit("list() no devuelve exactamente los archivos creados")
-
-    print_processes(cluster, results)
-    print_concurrency(results)
-    print_distribution(cluster)
-    check_queries(cluster, gateway)
-    show_operations(gateway)
-
-    stop_cluster()
-    print("\nDemo correcta")
+def main() -> None:
+    print("Arrancando Ray y el sistema (puede tardar unos segundos)...")
+    start_ray(include_dashboard=False, log_to_driver=False, logging_level="ERROR")
+    try:
+        gateway = Gateway()
+        show("Fichas (MetadataShard)", len(gateway._metadata))
+        show("Secciones del índice (TagShard)", len(gateway._tags))
+        show("Almacenes (StorageNode)", len(gateway._storage))
+        demo_operations(gateway)
+        demo_failures(gateway)
+        demo_partition()
+        demo_concurrency()
+        print("\nFin de la demostración.")
+    finally:
+        ray.shutdown()
 
 
 if __name__ == "__main__":

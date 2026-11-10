@@ -13,6 +13,9 @@ class ContentCorrupted(TagFSError):
 class StorageUnavailable(TagFSError):
     """No quedan nodos vivos donde guardar el contenido."""
 
+class NodeUnreachable(TagFSError):
+    """El nodo está vivo pero aislado por una partición de red."""
+
 def content_hash(data: bytes) -> str:
     """Devuelve el hash del contenido"""
     if not isinstance(data, bytes):

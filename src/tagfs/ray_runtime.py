@@ -1,8 +1,9 @@
 """Monta el sistema sobre Ray.
 
 Las clases de lógica (MetadataShard, TagShard, StorageNode) no importan Ray.
-Ray aparece solo en dos adaptadores: este archivo, que convierte las clases en
-actores, y content_store.py, que reparte el contenido entre los StorageNode.
+Este adaptador permite compartir los shards entre clientes independientes.
+gateway.py también ofrece el arranque de un gateway central con recuperación
+del índice; content_store.py reparte los bytes entre actores StorageNode.
 """
 
 from __future__ import annotations
@@ -14,9 +15,8 @@ from typing import Any, Callable, Iterable
 
 import ray
 
-import tagfs
 from tagfs.content_store import ContentStore
-from tagfs.gateway import Gateway
+from tagfs.gateway import Gateway, start_ray
 from tagfs.metadata_shard import MetadataShard
 from tagfs.storage_node import StorageNode
 from tagfs.tag_shard import TagShard
@@ -90,24 +90,33 @@ def start_cluster(
     replication_factor: int = REPLICATION_FACTOR,
 ) -> RayCluster:
     """Crea los actores. Viven mientras se conserve el RayCluster devuelto."""
+    if min(metadata_shards, tag_shards, storage_nodes, replication_factor) <= 0:
+        raise ValueError("Las cantidades de actores y réplicas deben ser positivas")
+    if replication_factor > storage_nodes:
+        raise ValueError("El factor de replicación no puede superar los nodos")
     if not ray.is_initialized():
         # py_modules envía el paquete a los workers: así no dependen de que tagfs
         # esté instalado en su máquina.
-        ray.init(
+        start_ray(
             include_dashboard=False,
             logging_level="ERROR",
-            runtime_env={"py_modules": [tagfs]},
         )
     storage = {f"storage-{i}": _StorageNodeActor.remote() for i in range(storage_nodes)}
     # ContentStore descarta un nodo que no responde dentro de su timeout. Un actor
     # recién creado puede tardar en arrancar, así que se espera a que todos respondan.
-    ray.get([node.pid.remote() for node in storage.values()])
-    return RayCluster(
+    cluster = RayCluster(
         metadata=tuple(ActorProxy(_MetadataShardActor.remote()) for _ in range(metadata_shards)),
         tags=tuple(ActorProxy(_TagShardActor.remote()) for _ in range(tag_shards)),
         storage=storage,
         replication_factor=replication_factor,
     )
+    actors = (*cluster.metadata, *cluster.tags)
+    ray.get(
+        [node.pid.remote() for node in storage.values()]
+        + [actor._actor.pid.remote() for actor in actors],
+        timeout=WORKER_START_TIMEOUT_SECONDS,
+    )
+    return cluster
 
 
 def stop_cluster() -> None:
