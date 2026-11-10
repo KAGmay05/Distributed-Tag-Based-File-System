@@ -3,26 +3,12 @@
 import pytest
 import ray
 
-import tagfs
 from tagfs.content import ContentCorrupted, ContentNotFound, StorageUnavailable, content_hash
 from tagfs.content_store import ContentStore, RemoteStorageNode
 from tagfs.storage_node import StorageNode
 
 DATA = b"hola"
 KEY = content_hash(DATA)
-
-
-@pytest.fixture(scope="module", autouse=True)
-def ray_cluster():
-    # Los workers no conocen src/: py_modules les envía el paquete.
-    ray.init(
-        num_cpus=2,
-        include_dashboard=False,
-        log_to_driver=False,
-        runtime_env={"py_modules": [tagfs]},
-    )
-    yield
-    ray.shutdown()
 
 
 def make_store(replication_factor=2, names=("A", "B", "C")):
@@ -179,3 +165,32 @@ def test_get_reports_corruption_when_no_replica_is_valid():
 
     with pytest.raises(ContentCorrupted):
         store.get(KEY)
+
+
+def test_sweep_removes_every_copy_of_content_that_is_not_live():
+    store, nodes = make_store(replication_factor=2)
+    kept = store.put(b"vivo")
+    store.put(DATA)
+
+    assert store.sweep({kept}) == 1
+
+    assert holders(nodes) == set()
+    assert store.get(kept) == b"vivo"
+
+
+def test_sweep_with_nothing_to_remove_returns_zero():
+    store, _ = make_store()
+    store.put(DATA)
+
+    assert store.sweep({KEY}) == 0
+    assert store.get(KEY) == DATA
+
+
+def test_sweep_skips_a_dead_node_and_cleans_the_rest():
+    store, nodes = make_store(replication_factor=3)
+    store.put(DATA)
+    ray.kill(nodes["A"])
+
+    assert store.sweep(set()) == 1
+
+    assert holders({name: node for name, node in nodes.items() if name != "A"}) == set()
