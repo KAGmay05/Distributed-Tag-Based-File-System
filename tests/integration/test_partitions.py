@@ -9,7 +9,7 @@ import ray
 
 from tagfs.content import ContentNotFound, content_hash
 from tagfs.content_store import ContentStore, RemoteStorageNode
-from tagfs.gateway import Gateway
+from tagfs.ray_runtime import start_cluster
 
 DATA = b"hola"
 KEY = content_hash(DATA)
@@ -130,8 +130,9 @@ def test_reconcile_without_failures_changes_nothing():
 
 
 def test_gateway_reconciles_after_a_partition():
-    gateway = Gateway()
-    nodes = gateway._storage
+    cluster = start_cluster()
+    gateway = cluster.gateway()
+    nodes = cluster.storage
     kept = [gateway.put(f"{i}.txt", f"antes {i}".encode(), {"doc"}) for i in range(10)]
     isolated = "storage-1"
     disconnect(nodes, isolated)

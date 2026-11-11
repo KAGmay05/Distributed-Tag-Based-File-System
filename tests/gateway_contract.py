@@ -6,7 +6,7 @@ clase no empieza por "Test", así que pytest solo ejecuta sus herederas.
 
 import pytest
 
-from tagfs.model import FileNotFound
+from tagfs.model import FileNotFound, InvalidQuery, InvalidTag
 
 
 class GatewayContract:
@@ -22,9 +22,55 @@ class GatewayContract:
         assert first != second
         assert gateway.list() == sorted([first, second])
 
-    def test_get_of_unknown_file_fails(self, gateway):
-        with pytest.raises(FileNotFound):
-            gateway.get("desconocido")
+    def test_every_operation_on_an_unknown_file_fails(self, gateway):
+        for operation in [
+            lambda: gateway.get("desconocido"),
+            lambda: gateway.delete("desconocido"),
+            lambda: gateway.add_tags("desconocido", {"doc"}),
+            lambda: gateway.remove_tags("desconocido", {"doc"}),
+            lambda: gateway.rename("desconocido", "b.txt"),
+        ]:
+            with pytest.raises(FileNotFound):
+                operation()
+
+    def test_change_without_effect_keeps_the_version(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+
+        assert gateway.add_tags(file_id, {"DOC"}) == 1
+        assert gateway.remove_tags(file_id, {"nunca-la-tuvo"}) == 1
+        assert gateway.rename(file_id, "a.txt") == 1
+        assert gateway.get(file_id).version == 1
+
+    def test_invalid_tag_is_rejected_and_changes_nothing(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+
+        with pytest.raises(InvalidTag):
+            gateway.put("b.txt", b"no debe guardarse", {"valida", "and"})
+        with pytest.raises(InvalidTag):
+            gateway.add_tags(file_id, {"valida", "dos palabras"})
+
+        assert gateway.list() == [file_id]
+        assert gateway.get(file_id) == ("a.txt", b"x", {"doc"}, 1)
+        assert gateway.query("valida") == []
+        assert gateway.collect_garbage() == 0  # el put rechazado no dejó bytes
+
+    def test_invalid_query_is_rejected(self, gateway):
+        for expr in ["", "doc AND", "(doc", "NOT doc", "doc OR NOT borrador"]:
+            with pytest.raises(InvalidQuery):
+                gateway.query(expr)
+
+    def test_deleted_file_can_be_deleted_again_but_not_changed(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+        gateway.delete(file_id)
+
+        assert gateway.delete(file_id) is None
+        for operation in [
+            lambda: gateway.add_tags(file_id, {"nueva"}),
+            lambda: gateway.remove_tags(file_id, {"doc"}),
+            lambda: gateway.rename(file_id, "b.txt"),
+        ]:
+            with pytest.raises(FileNotFound):
+                operation()
 
     def test_add_tags_returns_new_version_and_makes_file_queryable(self, gateway):
         file_id = gateway.put("a.txt", b"x", {"doc"})
@@ -94,3 +140,20 @@ class GatewayContract:
         gateway.delete(created[0])
 
         assert gateway.list() == sorted(created[1:])
+
+    def test_collect_garbage_removes_only_content_no_live_file_uses(self, gateway):
+        first = gateway.put("a.txt", b"igual", {"doc"})
+        second = gateway.put("b.txt", b"igual", {"doc"})
+        alone = gateway.put("c.txt", b"solo", {"doc"})
+
+        gateway.delete(first)
+        gateway.delete(alone)
+
+        assert gateway.collect_garbage() == 1  # b"solo"; b"igual" lo sigue usando second
+        assert gateway.get(second).content == b"igual"
+
+    def test_reconcile_without_failures_changes_nothing(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+
+        assert gateway.reconcile() == ([], 0, 0, 0, [])
+        assert gateway.get(file_id).content == b"x"

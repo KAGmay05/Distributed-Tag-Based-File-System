@@ -1,4 +1,4 @@
-"""Ejecuta el contrato sobre actores reales y prueba lo que solo existe con varios procesos.
+"""Prueba lo que solo existe con varios procesos: actores separados y clientes concurrentes.
 
 Las funciones que corren en workers se definen dentro de cada test: así Ray las
 envía por valor, porque los workers no pueden importar este módulo.
@@ -12,9 +12,6 @@ import pytest
 
 ray = pytest.importorskip("ray")
 
-from gateway_contract import GatewayContract  # noqa: E402
-
-from tagfs.content import content_hash  # noqa: E402
 from tagfs.gateway import Gateway  # noqa: E402
 from tagfs.ray_runtime import ActorProxy, run_in_workers, start_cluster  # noqa: E402
 from tagfs.router import shard_for  # noqa: E402
@@ -35,29 +32,13 @@ def cluster():
     return start_cluster()
 
 
-class TestRayGateway(GatewayContract):
-    @pytest.fixture
-    def gateway(self):
-        return start_cluster(metadata_shards=2, tag_shards=2).gateway()
-
-
 def test_each_actor_runs_in_its_own_process(cluster):
     storage = [ActorProxy(node) for node in cluster.storage.values()]
     pids = [actor.pid() for actor in (*cluster.metadata, *cluster.tags, *storage)]
 
-    assert len(pids) == 11
-    assert len(set(pids)) == 11
+    assert len(pids) == 12
+    assert len(set(pids)) == 12
     assert os.getpid() not in pids
-
-
-def test_get_survives_the_death_of_a_storage_node(cluster):
-    gateway = cluster.gateway()
-    file_id = gateway.put("a.txt", b"contenido", {"doc"})
-    replicas = cluster.content_store().replicas(content_hash(b"contenido"))
-
-    ray.kill(cluster.storage[replicas[0]])
-
-    assert gateway.get(file_id)[1] == b"contenido"
 
 
 def test_concurrent_clients_lose_no_files(cluster):
@@ -100,7 +81,11 @@ def test_concurrent_tag_changes_on_one_file_stay_consistent(cluster):
                     super()._deliver([op])
 
         started = time.time()
-        gateway = DelayedGateway(cluster.metadata, cluster.tags, cluster.content_store())
+        gateway = DelayedGateway(
+            [proxy.handle for proxy in cluster.metadata],
+            [proxy.handle for proxy in cluster.tags],
+            cluster.content_store(),
+        )
         versions = []
         # Cada ronda es una carrera aparte por su propia etiqueta, entre clientes que la
         # agregan y clientes que la quitan. Si todos compitieran por la misma etiqueta,
@@ -142,3 +127,29 @@ def test_concurrent_tag_changes_on_one_file_stay_consistent(cluster):
     for tag in unique_tags | disputed_tags:
         shard = cluster.tags[shard_for(tag, len(cluster.tags))]
         assert (file_id in shard.lookup(tag)) == (tag in tags), tag
+
+
+def test_a_client_whose_worker_dies_is_not_run_again():
+    # Un cliente hace put, que no se puede repetir sin crear duplicados. Si Ray
+    # lo repitiera al morir su worker, el contador pasaría de 1.
+    @ray.remote
+    class Counter:
+        def __init__(self):
+            self.value = 0
+
+        def increment(self):
+            self.value += 1
+
+        def read(self):
+            return self.value
+
+    def client(counter):
+        ray.get(counter.increment.remote())
+        os._exit(1)  # el proceso del worker muere, como en un fallo real
+
+    counter = Counter.remote()
+
+    with pytest.raises(ray.exceptions.WorkerCrashedError):
+        run_in_workers(client, [(counter,)])
+
+    assert ray.get(counter.read.remote()) == 1

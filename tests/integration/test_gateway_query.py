@@ -7,13 +7,13 @@ para no ver los archivos de los demás.
 import pytest
 import ray
 
-from tagfs.gateway import Gateway
 from tagfs.model import IndexOp, InvalidQuery
+from tagfs.ray_runtime import start_cluster
 
 
 @pytest.fixture(scope="module")
 def gateway():
-    return Gateway()
+    return start_cluster().gateway()
 
 
 def test_query_combines_tags(gateway):
@@ -91,4 +91,4 @@ def test_list_returns_live_files_in_order(gateway):
 
 
 def test_list_of_a_new_system_is_empty():
-    assert Gateway(metadata_shards=2, tag_shards=1, storage_nodes=2).list() == []
+    assert start_cluster(metadata_shards=2, tag_shards=1, storage_nodes=2).gateway().list() == []

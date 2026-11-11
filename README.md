@@ -23,12 +23,11 @@ solo la lógica local: `python -m pytest tests/unit -q`.
 ## API y ejecución
 
 ```python
-import ray
-from tagfs.gateway import Gateway, start_gateway, start_ray
+from tagfs.ray_runtime import start_cluster, stop_cluster
 
-start_ray(include_dashboard=False)
+cluster = start_cluster()  # arranca Ray si hace falta y crea los actores
 try:
-    gateway = Gateway()
+    gateway = cluster.gateway()
     file_id = gateway.put("nota.txt", b"hola", {"Documento", "trabajo"})
     gateway.add_tags(file_id, {"urgente"})
     stored = gateway.get(file_id)
@@ -40,37 +39,47 @@ try:
     gateway.delete(file_id)
     gateway.collect_garbage()
 
-    # Varios clientes comparten este handle y llaman con .remote().
-    shared = start_gateway()
-    other_id = ray.get(shared.put.remote("otra.txt", b"otros bytes", {"doc"}))
-    assert ray.get(shared.get.remote(other_id)).content == b"otros bytes"
+    # Otro cliente: su propio gateway sobre los mismos actores.
+    other = cluster.gateway()
+    other_id = other.put("otra.txt", b"otros bytes", {"doc"})
+    assert gateway.get(other_id).content == b"otros bytes"
 finally:
-    ray.shutdown()
+    stop_cluster()
 ```
 
-`Gateway()` crea 3 shards de metadatos, 4 de etiquetas y 4 almacenes, con 2
-réplicas por contenido. Estas cantidades se configuran con `metadata_shards`,
-`tag_shards`, `storage_nodes` y `replication_factor`. `get` devuelve un
-`StoredFile(name, content, tags, version)`, compatible con acceso por atributos,
-índices y desempaquetado. Las mutaciones sin efecto conservan la versión.
+`start_cluster()` es la única forma de arrancar el sistema. Crea 4 shards de
+metadatos, 4 de etiquetas y 4 almacenes, con 2 réplicas por contenido; estas
+cantidades se configuran con `metadata_shards`, `tag_shards`, `storage_nodes` y
+`replication_factor`. El `RayCluster` que devuelve se puede enviar a otros
+workers: cada cliente llama a `cluster.gateway()` y obtiene su propio gateway,
+que habla directamente con los actores y envía a la vez las peticiones
+independientes a varios shards. `python scripts/demo_clients.py` muestra varios
+clientes trabajando a la vez.
+
+`get` devuelve un `StoredFile(name, content, tags, version)`, compatible con
+acceso por atributos, índices y desempaquetado. Las mutaciones sin efecto
+conservan la versión.
 
 Las etiquetas se normalizan a minúsculas. Las consultas admiten `AND`, `OR`,
 `NOT` y paréntesis; cada rama necesita una parte positiva que permita obtener
 candidatos del índice. Por ejemplo, `foto AND NOT borrador` es válida y
 `NOT borrador` se rechaza. Los candidatos se verifican contra los metadatos.
 
-Se mantiene la API `Gateway(metadata, tags, content)` para conectar objetos
-locales o adaptadores síncronos existentes. `start_cluster()` en
-`tagfs.ray_runtime` permite distribuir clientes que hablan directamente con los
-shards; `python scripts/demo_clients.py` muestra este modo. Cada llamada a
-`cluster.gateway()` usa los mismos actores y su propio cliente de contenido.
+`Gateway(metadata, tags, content)` también acepta shards locales, sin Ray, para
+probar la lógica. El comportamiento externo está fijado en
+`tests/gateway_contract.py`, que se ejecuta sin Ray y con actores reales.
 
 ## Recuperación y límites actuales
 
-- El gateway que crea sus propios actores reconstruye un shard de etiquetas
-  muerto o sin respuesta desde los metadatos. Los componentes inyectados y los
-  clientes de `RayCluster` conservan su política de errores; no reemplazan
-  automáticamente los actores compartidos del índice.
+- Un shard de etiquetas se reinicia solo. Ray lo vuelve a arrancar con el mismo
+  handle cuando muere su proceso, y el gateway pide el reinicio si no responde en
+  `index_timeout`. Al arrancar se rellena desde los metadatos, así que la
+  reparación sirve a todos los clientes. Las peticiones pendientes se repiten en
+  el actor nuevo, lo que es seguro porque consultar solo lee y aplicar un cambio
+  que ya se conoce no tiene efecto.
+- Un shard de metadatos no se reinicia: uno nuevo empezaría vacío y diría que
+  sus archivos no existen. Si muere, sus archivos dejan de estar disponibles y
+  las operaciones que los necesitan fallan.
 - Un almacén muerto o aislado sale del anillo. Las escrituras usan los nodos
   disponibles, aunque queden menos réplicas de las solicitadas. `reconcile()`
   readmite nodos que vuelven, repara réplicas faltantes o corruptas, retira copias
@@ -79,19 +88,17 @@ shards; `python scripts/demo_clients.py` muestra este modo. Cada llamada a
 - `delete()` elimina la ficha lógica y sus entradas del índice. Los bytes se
   conservan hasta `collect_garbage()` o `reconcile()`, pues otros archivos pueden
   compartirlos. Los contadores de basura incluyen solo borrados confirmados.
-- La recolección y reconciliación deben ejecutarse sin escrituras concurrentes.
-  `start_gateway()` serializa todas las operaciones de sus clientes y cumple esa
-  condición. Para un objeto `Gateway` usado desde varios hilos, o varios clientes
-  independientes del mismo `RayCluster`, el llamador debe detener las escrituras
-  de todos ellos durante el mantenimiento.
-- Todo el estado reside en memoria. No hay persistencia en disco, replicación de
-  metadatos ni recuperación de un shard de metadatos muerto. Si se pierden todas
-  las copias de un contenido, su ficha sigue existiendo, pero la lectura falla.
-- El gateway compartido es un punto único de fallo; arrancar otro con
-  `start_gateway()` crea un sistema vacío. La variante con clientes independientes
-  evita ese gateway central, pero aún necesita coordinación de mantenimiento y
-  recuperación compartida del índice para ofrecer las mismas garantías.
+- La recolección y la reconciliación no deben cruzarse con un `put` de ningún
+  cliente: borrarían bytes cuya ficha aún no existe. El llamador debe detener
+  las escrituras de todos los clientes durante el mantenimiento.
+- No hay gateway central: si un cliente se cae, los demás siguen trabajando.
+  Si se cae en mitad de un cambio, después de que los metadatos lo aceptaran
+  pero antes de avisar al índice, el índice no se entera hasta que su shard se
+  reinicie.
+- Todo el estado reside en memoria. No hay persistencia en disco ni réplicas de
+  los metadatos. Si se pierden todas las copias de un contenido, su ficha sigue
+  existiendo, pero la lectura falla.
 
-La persistencia, la recuperación de metadatos y del gateway, y la coordinación
-del mantenimiento entre clientes independientes quedan pendientes para ofrecer
-durabilidad más allá de esta implementación en memoria.
+La persistencia y la replicación de los metadatos, la entrega garantizada de
+cambios al índice y la coordinación del mantenimiento entre clientes quedan
+pendientes.

@@ -144,6 +144,22 @@ def candidates(expr: Expr, lookup: Callable[[str], Iterable[FileId]]) -> set[Fil
     raise InvalidQuery("La consulta necesita una parte positiva")
 
 
+def index_tags(expr: Expr) -> set[str]:
+    """Devuelve las etiquetas que candidates() le pedirá al índice.
+
+    Sirve para pedirlas todas a la vez antes de llamar a candidates(). Recorre
+    la expresión igual que candidates(): un NOT no se pide al índice.
+    """
+    match expr:
+        case Tag(name):
+            return {name}
+        case Or(items):
+            return set().union(*(index_tags(item) for item in items))
+        case And(items):
+            return set().union(*(index_tags(item) for item in items if is_bounded(item)))
+    return set()
+
+
 def matches(expr: Expr, tags: Collection[str]) -> bool:
     """Evalúa la expresión con las etiquetas reales de un archivo."""
     match expr:

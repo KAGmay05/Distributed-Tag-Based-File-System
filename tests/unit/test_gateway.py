@@ -148,8 +148,3 @@ def test_stored_file_supports_attributes_and_tuple_access():
 def test_gateway_rejects_empty_injected_shards(metadata, tags):
     with pytest.raises(ValueError):
         Gateway(metadata, tags, FakeContentStore())
-
-
-def test_gateway_rejects_partial_dependencies():
-    with pytest.raises(ValueError):
-        Gateway(metadata=[MetadataShard()])

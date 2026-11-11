@@ -1,33 +1,32 @@
-"""Gateway: punto de entrada del sistema, coordina a todos los actores."""
+"""Gateway: lo que usa cada cliente para trabajar con el sistema."""
 
 from __future__ import annotations
 
 import uuid
 from collections import defaultdict
-from typing import Any, Iterable, NamedTuple, Protocol, Sequence
+from typing import Any, Collection, Iterable, NamedTuple, Protocol, Sequence
 
 import ray
-from ray.exceptions import GetTimeoutError, RayActorError
+from ray.actor import ActorHandle
+from ray.exceptions import GetTimeoutError
 
-import tagfs
 from tagfs.content import ContentCorrupted, content_hash
-from tagfs.content_store import ContentStore, Reconciliation, RemoteStorageNode
-from tagfs.metadata_shard import MetadataShard
+from tagfs.content_store import Reconciliation
 from tagfs.model import FileId, FileMeta, IndexOp, normalize_tags
-from tagfs.query import candidates, matches, parse_query
+from tagfs.query import candidates, index_tags, matches, parse_query
 from tagfs.router import shard_for
-from tagfs.tag_shard import TagShard
-
-RemoteMetadataShard = ray.remote(MetadataShard)
-RemoteTagShard = ray.remote(TagShard)
 
 
 class ContentAPI(Protocol):
-    """Interfaz mínima para conectar un almacén de contenido al gateway."""
+    """Lo que el gateway necesita de un almacén de contenido."""
 
     def put(self, content: bytes) -> str: ...
 
     def get(self, content_hash: str) -> bytes: ...
+
+    def sweep(self, live_keys: Collection[str]) -> int: ...
+
+    def reconcile(self, live_keys: Collection[str]) -> Reconciliation: ...
 
 
 def _verify(content: bytes, expected_hash: str) -> None:
@@ -44,65 +43,45 @@ class StoredFile(NamedTuple):
     version: int
 
 
-def start_ray(**options: Any) -> None:
-    """Arranca Ray enviando el paquete a los workers, que no conocen src/."""
-    ray.init(runtime_env={"py_modules": [tagfs]}, **options)
-
-
 class Gateway:
-    """Coordina los componentes del sistema.
+    """Lo que usa un cliente para trabajar con el sistema.
 
-    Sin dependencias crea los actores de Ray y espera a que estén listos.
-    También acepta metadata, tags y content explícitos, como objetos locales
-    o adaptadores síncronos de actores, para reutilizar un clúster existente.
+    Recibe los shards de metadatos y de etiquetas y un almacén de contenido. Los
+    shards son handles de actores de Ray, como los que crea start_cluster en
+    tagfs.ray_runtime, u objetos locales para probar la lógica sin Ray. Con
+    actores, las peticiones independientes a varios shards se envían a la vez.
+    Cada cliente tiene su propio Gateway; todos comparten los mismos actores.
 
     Los metadatos son la fuente de verdad y el índice se deriva de ellos: un
-    cambio está hecho en cuanto lo aceptan los metadatos. En el modo que crea
-    sus propios actores, reemplaza un TagShard muerto o sin respuesta por uno
-    nuevo reconstruido desde los metadatos.
+    cambio está hecho en cuanto lo aceptan los metadatos.
 
-    El arranque de actores requiere que Ray ya esté iniciado con start_ray.
+    Si un TagShard no responde a tiempo, el gateway pide a Ray que lo reinicie.
+    Los TagShard de start_cluster se reinician con el mismo handle y se rellenan
+    desde los metadatos, así que la reparación sirve a todos los clientes.
     """
 
     def __init__(
         self,
-        metadata: Sequence[Any] | None = None,
-        tags: Sequence[Any] | None = None,
-        content: ContentAPI | None = None,
+        metadata: Sequence[Any],
+        tags: Sequence[Any],
+        content: ContentAPI,
         *,
-        metadata_shards: int = 3,
-        tag_shards: int = 4,
-        storage_nodes: int = 4,
-        replication_factor: int = 2,
-        startup_timeout: float = 120.0,
         index_timeout: float = 5.0,
+        restart_timeout: float = 120.0,
     ) -> None:
-        supplied = (metadata is not None, tags is not None, content is not None)
-        if any(supplied) and not all(supplied):
-            raise ValueError("Se deben proporcionar metadata, tags y content juntos")
-        self._remote = not any(supplied)
-        self._startup_timeout = startup_timeout
+        if not metadata or not tags:
+            raise ValueError("Se necesita al menos un shard de metadatos y etiquetas")
+        are_actors = [isinstance(shard, ActorHandle) for shard in (*metadata, *tags)]
+        if any(are_actors) and not all(are_actors):
+            raise ValueError("Los shards deben ser todos actores de Ray o todos objetos locales")
+        # Con actores se les llama con .remote() y se espera después; con objetos
+        # locales, directamente.
+        self._remote = all(are_actors)
+        self._metadata = list(metadata)
+        self._tags = list(tags)
+        self._content = content
         self._index_timeout = index_timeout
-        if not self._remote:
-            if not metadata or not tags:
-                raise ValueError("Se necesita al menos un shard de metadatos y etiquetas")
-            self._metadata = metadata
-            self._tags = tags
-            self._content = content
-            return
-        if min(metadata_shards, tag_shards, storage_nodes, replication_factor) <= 0:
-            raise ValueError("Las cantidades de actores y réplicas deben ser positivas")
-        if replication_factor > storage_nodes:
-            raise ValueError(
-                f"No caben {replication_factor} réplicas en {storage_nodes} nodos"
-            )
-        self._metadata = [RemoteMetadataShard.remote() for _ in range(metadata_shards)]
-        self._tags = [RemoteTagShard.remote() for _ in range(tag_shards)]
-        self._storage = {
-            f"storage-{i}": RemoteStorageNode.remote() for i in range(storage_nodes)
-        }
-        self._wait_until_ready(startup_timeout)
-        self._content = ContentStore(self._storage, replication_factor)
+        self._restart_timeout = restart_timeout
 
     def put(self, name: str, content: bytes, tags: Iterable[str] = ()) -> FileId:
         """Crea un archivo y devuelve su ID.
@@ -155,7 +134,8 @@ class Gateway:
         etiquetas actuales de los metadatos, porque el índice puede ir atrasado.
         """
         parsed = parse_query(expr)
-        found = candidates(parsed, self._lookup)
+        index = self._lookup_many(index_tags(parsed))  # todas las etiquetas a la vez
+        found = candidates(parsed, lambda tag: index[tag])
         files = self._read_many(found)
         return sorted(file_id for file_id, meta in files.items() if matches(parsed, meta.tags))
 
@@ -168,9 +148,9 @@ class Gateway:
         """Borra de los almacenes el contenido que ningún archivo vivo usa.
 
         Devuelve cuántos contenidos distintos se borraron. No debe correr a la
-        vez que un put: borraría los bytes que ese put ya guardó y cuya ficha aún
-        no existe. start_gateway serializa las operaciones de sus clientes. Con
-        clientes independientes, el llamador debe detener todas las escrituras.
+        vez que un put de ningún cliente: borraría los bytes que ese put ya
+        guardó y cuya ficha aún no existe. El llamador debe detener antes las
+        escrituras de todos los clientes.
         """
         live = {meta.content_hash for meta in self._live_files()}
         return self._content.sweep(live)
@@ -185,15 +165,21 @@ class Gateway:
         live = {meta.content_hash for meta in self._live_files()}
         return self._content.reconcile(live)
 
-    def _lookup(self, tag: str) -> set[FileId]:
-        index = self._tag_index(tag)
+    def _lookup_many(self, tags: Iterable[str]) -> dict[str, set[FileId]]:
+        """Devuelve los archivos de cada etiqueta, pidiéndolas todas antes de esperar."""
         if not self._remote:
-            return self._tags[index].lookup(tag)
-        try:
-            return ray.get(self._tags[index].lookup.remote(tag), timeout=self._index_timeout)
-        except (RayActorError, GetTimeoutError):
-            self._rebuild_tag_shard(index)
-            return ray.get(self._tags[index].lookup.remote(tag), timeout=self._index_timeout)
+            return {tag: self._tag_shard_for(tag).lookup(tag) for tag in tags}
+        by_shard: dict[int, list[str]] = defaultdict(list)
+        for tag in tags:
+            by_shard[self._tag_index(tag)].append(tag)
+        sent = {
+            index: [self._tags[index].lookup.remote(tag) for tag in group]
+            for index, group in by_shard.items()
+        }
+        found: dict[str, set[FileId]] = {}
+        for index, group in by_shard.items():
+            found.update(zip(group, self._wait_for_index(index, sent[index])))
+        return found
 
     def _read_many(self, file_ids: Iterable[FileId]) -> dict[FileId, FileMeta]:
         # Una sola llamada por shard, y todas a la vez, en lugar de una por archivo.
@@ -217,30 +203,26 @@ class Gateway:
             for op in ops:
                 self._tag_shard_for(op.tag).apply(op)
             return
-        by_shard: dict[int, list[Any]] = defaultdict(list)
+        sent: dict[int, list[Any]] = defaultdict(list)
         for op in ops:
             index = self._tag_index(op.tag)
-            by_shard[index].append(self._tags[index].apply.remote(op))
-        for index, refs in by_shard.items():
-            try:
-                ray.get(refs, timeout=self._index_timeout)
-            except (RayActorError, GetTimeoutError):
-                # Los metadatos ya cambiaron, así que la reconstrucción incluye este cambio.
-                self._rebuild_tag_shard(index)
+            sent[index].append(self._tags[index].apply.remote(op))
+        for index, refs in sent.items():
+            self._wait_for_index(index, refs)
 
-    def _rebuild_tag_shard(self, index: int) -> None:
-        # El estado del actor viejo se da por perdido aunque solo fuera lento:
-        # se descarta y el nuevo se llena con las etiquetas actuales de cada archivo.
-        ray.kill(self._tags[index])
-        shard = RemoteTagShard.remote()
-        refs = [
-            shard.apply.remote(IndexOp(tag, meta.file_id, True, meta.version))
-            for meta in self._live_files()
-            for tag in meta.tags
-            if self._tag_index(tag) == index
-        ]
-        ray.get(refs + [shard.lookup.remote("")], timeout=self._startup_timeout)
-        self._tags[index] = shard
+    def _wait_for_index(self, index: int, refs: list[Any]) -> list[Any]:
+        """Espera las respuestas de un TagShard; si no llegan a tiempo, lo reinicia.
+
+        Un shard muerto y uno colgado se ven igual desde fuera. Con no_restart=False,
+        Ray lo reinicia con el mismo handle, el actor nuevo se rellena desde los
+        metadatos y Ray le repite las peticiones pendientes. Repetirlas es seguro:
+        lookup solo lee y apply ignora un cambio que ya conoce.
+        """
+        try:
+            return ray.get(refs, timeout=self._index_timeout)
+        except GetTimeoutError:
+            ray.kill(self._tags[index], no_restart=False)
+            return ray.get(refs, timeout=self._restart_timeout)
 
     def _live_files(self) -> list[FileMeta]:
         ids = self._resolve([self._call(shard, "list_ids") for shard in self._metadata])
@@ -254,14 +236,6 @@ class Gateway:
     def _resolve(self, result: Any) -> Any:
         return ray.get(result) if self._remote else result
 
-    def _wait_until_ready(self, timeout: float) -> None:
-        # Un actor recién creado tarda en arrancar. Se espera aquí para que ese
-        # retraso no se confunda después con un nodo caído.
-        refs = [shard.list_ids.remote() for shard in self._metadata]
-        refs += [shard.lookup.remote("") for shard in self._tags]
-        refs += [node.list_keys.remote() for node in self._storage.values()]
-        ray.get(refs, timeout=timeout)
-
     def _metadata_for(self, file_id: FileId) -> Any:
         return self._metadata[shard_for(file_id, len(self._metadata))]
 
@@ -270,18 +244,3 @@ class Gateway:
 
     def _tag_index(self, tag: str) -> int:
         return shard_for(tag, len(self._tags))
-
-
-RemoteGateway = ray.remote(Gateway)
-
-
-def start_gateway(**options: Any) -> Any:
-    """Crea el Gateway como actor, para que varios clientes lo compartan.
-
-    Cada cliente llama a sus métodos con .remote(). El actor atiende una
-    operación a la vez, así que reconstruir el índice o recolectar basura
-    nunca se cruza con otra operación.
-    """
-    gateway = RemoteGateway.remote(**options)
-    ray.get(gateway.list.remote())  # espera a que termine de crear sus actores
-    return gateway

@@ -1,7 +1,7 @@
 import pytest
 
 from tagfs.model import InvalidQuery, InvalidTag, normalize_tag
-from tagfs.query import And, Not, Or, Tag, candidates, matches, parse_query
+from tagfs.query import And, Not, Or, Tag, candidates, index_tags, matches, parse_query
 
 A, B, C = Tag("a"), Tag("b"), Tag("c")
 
@@ -109,3 +109,26 @@ def test_candidates_combine_the_index(text, expected):
 @pytest.mark.parametrize("text", ["a AND NOT b", "a AND (b OR NOT c)"])
 def test_candidates_never_subtract_from_the_index(text):
     assert candidates(parse_query(text), lookup) == {"f1", "f2"}
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("a", {"a"}),
+        ("a AND a", {"a"}),
+        ("a OR b AND c", {"a", "b", "c"}),
+        ("(a OR b) AND c AND NOT d", {"a", "b", "c"}),
+        ("a AND NOT b", {"a"}),
+        ("a AND (b OR NOT c)", {"a"}),
+    ],
+)
+def test_index_tags_are_exactly_the_tags_candidates_asks_for(text, expected):
+    asked = set()
+
+    def recording_lookup(tag):
+        asked.add(tag)
+        return lookup(tag)
+
+    candidates(parse_query(text), recording_lookup)
+
+    assert index_tags(parse_query(text)) == expected == asked

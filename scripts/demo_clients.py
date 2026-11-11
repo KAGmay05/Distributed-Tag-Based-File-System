@@ -1,6 +1,6 @@
 """Demo: varios clientes usan el sistema a la vez sobre actores de Ray.
 
-Uso: python scripts/demo.py
+Uso: python scripts/demo_clients.py
 """
 
 import os

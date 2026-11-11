@@ -1,31 +1,42 @@
-"""Monta el sistema sobre Ray.
+"""Monta el sistema sobre Ray: el único sitio que arranca Ray y crea actores.
 
 Las clases de lógica (MetadataShard, TagShard, StorageNode) no importan Ray.
-Este adaptador permite compartir los shards entre clientes independientes.
-gateway.py también ofrece el arranque de un gateway central con recuperación
-del índice; content_store.py reparte los bytes entre actores StorageNode.
+start_cluster crea sus actores una sola vez; cada cliente usa cluster.gateway()
+y habla directamente con ellos. content_store.py reparte los bytes entre los
+actores StorageNode.
 """
 
 from __future__ import annotations
 
 import os
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 import ray
 
+import tagfs
 from tagfs.content_store import ContentStore
-from tagfs.gateway import Gateway, start_ray
+from tagfs.gateway import Gateway
 from tagfs.metadata_shard import MetadataShard
+from tagfs.model import FileMeta, IndexOp
+from tagfs.router import shard_for
 from tagfs.storage_node import StorageNode
 from tagfs.tag_shard import TagShard
 
+# Tamaño del sistema por defecto.
 METADATA_SHARDS = 4
 TAG_SHARDS = 4
-STORAGE_NODES = 3
+STORAGE_NODES = 4
 REPLICATION_FACTOR = 2
+
 WORKER_START_TIMEOUT_SECONDS = 120
+
+
+def start_ray(**options: Any) -> None:
+    """Arranca Ray enviando el paquete a los workers, que no conocen src/."""
+    ray.init(runtime_env={"py_modules": [tagfs]}, **options)
 
 
 class _ProcessInfo:
@@ -33,14 +44,42 @@ class _ProcessInfo:
         return os.getpid()
 
 
+# Los MetadataShard y los StorageNode no se reinician: un actor nuevo empezaría
+# vacío, y un MetadataShard vacío diría que sus archivos no existen en lugar de
+# avisar del fallo.
 @ray.remote
 class _MetadataShardActor(_ProcessInfo, MetadataShard):
     pass
 
 
-@ray.remote
+def _live_files(metadata: Sequence[Any]) -> list[FileMeta]:
+    """Lee a la vez las fichas vivas de todos los shards de metadatos."""
+    ids = ray.get([shard.list_ids.remote() for shard in metadata])
+    answers = ray.get([shard.get_many.remote(found) for shard, found in zip(metadata, ids)])
+    return [meta for answer in answers for meta in answer.values()]
+
+
+# Un TagShard sí se reinicia, porque su estado se puede reconstruir desde los
+# metadatos. max_restarts=-1: Ray lo arranca de nuevo, con el mismo handle, cada
+# vez que muere su proceso. max_task_retries=-1: las peticiones que estaban en
+# curso se repiten en el actor nuevo, lo que es seguro porque lookup solo lee y
+# apply ignora un cambio que ya conoce.
+@ray.remote(max_restarts=-1, max_task_retries=-1)
 class _TagShardActor(_ProcessInfo, TagShard):
-    pass
+    """TagShard que se rellena desde los metadatos cada vez que arranca."""
+
+    def __init__(self, index: int, shard_count: int, metadata_names: Sequence[str]) -> None:
+        super().__init__()
+        # Recibe nombres y no handles. Para reiniciar el actor, Ray repite __init__
+        # con los mismos argumentos; unos handles irían al almacén de objetos, de
+        # donde se pueden perder, y entonces el reinicio fallaría.
+        metadata = [ray.get_actor(name) for name in metadata_names]
+        # La primera vez los metadatos están vacíos. Tras un reinicio, Ray vuelve
+        # a ejecutar __init__ y así se recupera el índice desde la fuente de verdad.
+        for meta in _live_files(metadata):
+            for tag in meta.tags:
+                if shard_for(tag, shard_count) == index:
+                    self.apply(IndexOp(tag, meta.file_id, True, meta.version))
 
 
 @ray.remote
@@ -49,10 +88,19 @@ class _StorageNodeActor(_ProcessInfo, StorageNode):
 
 
 class ActorProxy:
-    """Permite usar un actor como si fuera un objeto normal."""
+    """Permite usar un actor como si fuera un objeto normal.
+
+    Cada llamada espera su respuesta. Es cómodo para demos y tests, pero quien
+    necesite hablar con varios actores a la vez debe usar handle.
+    """
 
     def __init__(self, actor: Any) -> None:
         self._actor = actor
+
+    @property
+    def handle(self) -> Any:
+        """El handle de Ray del actor, para enviar peticiones sin esperar."""
+        return self._actor
 
     def __getattr__(self, method: str) -> Callable[..., Any]:
         # Al deserializar, pickle busca atributos como __setstate__ cuando _actor
@@ -79,8 +127,16 @@ class RayCluster:
         # actor muriera, nadie podría leer ni escribir contenido.
         return ContentStore(self.storage, self.replication_factor)
 
-    def gateway(self) -> Gateway:
-        return Gateway(self.metadata, self.tags, self.content_store())
+    def gateway(self, **options: Any) -> Gateway:
+        """Crea el gateway de un cliente; options se pasan a Gateway (timeouts)."""
+        # Con los handles, sin ActorProxy, el gateway envía a la vez las peticiones
+        # a varios shards en lugar de esperar cada respuesta antes de la siguiente.
+        return Gateway(
+            [proxy.handle for proxy in self.metadata],
+            [proxy.handle for proxy in self.tags],
+            self.content_store(),
+            **options,
+        )
 
 
 def start_cluster(
@@ -89,34 +145,35 @@ def start_cluster(
     storage_nodes: int = STORAGE_NODES,
     replication_factor: int = REPLICATION_FACTOR,
 ) -> RayCluster:
-    """Crea los actores. Viven mientras se conserve el RayCluster devuelto."""
+    """Arranca Ray si hace falta y crea los actores del sistema.
+
+    Los actores viven mientras se conserve el RayCluster devuelto.
+    """
     if min(metadata_shards, tag_shards, storage_nodes, replication_factor) <= 0:
         raise ValueError("Las cantidades de actores y réplicas deben ser positivas")
     if replication_factor > storage_nodes:
         raise ValueError("El factor de replicación no puede superar los nodos")
     if not ray.is_initialized():
-        # py_modules envía el paquete a los workers: así no dependen de que tagfs
-        # esté instalado en su máquina.
-        start_ray(
-            include_dashboard=False,
-            logging_level="ERROR",
-        )
+        start_ray(include_dashboard=False, logging_level="ERROR")
+    # Los TagShard buscan los shards de metadatos por nombre. El prefijo distingue
+    # los actores de cada clúster cuando hay varios en la misma sesión de Ray.
+    prefix = f"tagfs-{uuid.uuid4().hex}"
+    metadata_names = [f"{prefix}-metadata-{i}" for i in range(metadata_shards)]
+    metadata = [_MetadataShardActor.options(name=name).remote() for name in metadata_names]
+    tags = [_TagShardActor.remote(index, tag_shards, metadata_names) for index in range(tag_shards)]
     storage = {f"storage-{i}": _StorageNodeActor.remote() for i in range(storage_nodes)}
-    # ContentStore descarta un nodo que no responde dentro de su timeout. Un actor
-    # recién creado puede tardar en arrancar, así que se espera a que todos respondan.
-    cluster = RayCluster(
-        metadata=tuple(ActorProxy(_MetadataShardActor.remote()) for _ in range(metadata_shards)),
-        tags=tuple(ActorProxy(_TagShardActor.remote()) for _ in range(tag_shards)),
+    # Un actor recién creado tarda en arrancar. Se espera aquí a que todos respondan
+    # para que ese retraso no se confunda después con un actor caído.
+    ray.get(
+        [actor.pid.remote() for actor in (*metadata, *tags, *storage.values())],
+        timeout=WORKER_START_TIMEOUT_SECONDS,
+    )
+    return RayCluster(
+        metadata=tuple(ActorProxy(actor) for actor in metadata),
+        tags=tuple(ActorProxy(actor) for actor in tags),
         storage=storage,
         replication_factor=replication_factor,
     )
-    actors = (*cluster.metadata, *cluster.tags)
-    ray.get(
-        [node.pid.remote() for node in storage.values()]
-        + [actor._actor.pid.remote() for actor in actors],
-        timeout=WORKER_START_TIMEOUT_SECONDS,
-    )
-    return cluster
 
 
 def stop_cluster() -> None:
@@ -139,7 +196,9 @@ class _StartBarrier:
 
 
 # num_cpus=0: quien espera en la barrera no debe ocupar el CPU que otro necesita para arrancar.
-@ray.remote(num_cpus=0)
+# max_retries=0: por defecto Ray repite una task cuyo worker muere, y repetir un
+# cliente repetiría sus put, cada uno con un ID nuevo. Mejor que el fallo se vea.
+@ray.remote(num_cpus=0, max_retries=0)
 def _run_after_barrier(barrier: Any, function: Callable[..., Any], args: tuple[Any, ...]) -> Any:
     ray.get(barrier.arrive.remote())
     deadline = time.monotonic() + WORKER_START_TIMEOUT_SECONDS

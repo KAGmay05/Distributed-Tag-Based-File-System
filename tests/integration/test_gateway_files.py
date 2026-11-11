@@ -4,18 +4,23 @@ import pytest
 import ray
 
 from tagfs.content import content_hash
-from tagfs.gateway import Gateway
 from tagfs.model import FileNotFound, InvalidTag
+from tagfs.ray_runtime import start_cluster
 
 
 @pytest.fixture(scope="module")
-def gateway():
-    return Gateway()
+def cluster():
+    return start_cluster()
 
 
-def copies_of(gateway, content):
+@pytest.fixture(scope="module")
+def gateway(cluster):
+    return cluster.gateway()
+
+
+def copies_of(cluster, content):
     key = content_hash(content)
-    answers = ray.get([node.has.remote(key) for node in gateway._storage.values()])
+    answers = ray.get([node.has.remote(key) for node in cluster.storage.values()])
     return sum(answers)
 
 
@@ -54,7 +59,7 @@ def test_put_adds_the_file_to_the_index_of_each_tag(gateway):
     assert file_id in files_with_tag(gateway, "otra-indexada")
 
 
-def test_same_content_gives_two_files_but_is_stored_once(gateway):
+def test_same_content_gives_two_files_but_is_stored_once(cluster, gateway):
     first = gateway.put("playa.jpg", b"contenido compartido", {"original"})
     second = gateway.put("copia.jpg", b"contenido compartido", {"copia"})
 
@@ -62,7 +67,7 @@ def test_same_content_gives_two_files_but_is_stored_once(gateway):
     assert gateway.get(first).name == "playa.jpg"
     assert gateway.get(second).name == "copia.jpg"
     assert gateway.get(first).content == gateway.get(second).content
-    assert copies_of(gateway, b"contenido compartido") == 2
+    assert copies_of(cluster, b"contenido compartido") == 2
 
 
 def test_get_of_unknown_file_fails(gateway):
@@ -70,11 +75,11 @@ def test_get_of_unknown_file_fails(gateway):
         gateway.get("no-existe")
 
 
-def test_invalid_tag_stores_nothing(gateway):
+def test_invalid_tag_stores_nothing(cluster, gateway):
     with pytest.raises(InvalidTag):
         gateway.put("a.jpg", b"no debe guardarse", {"valida", "and"})
 
-    assert copies_of(gateway, b"no debe guardarse") == 0
+    assert copies_of(cluster, b"no debe guardarse") == 0
     assert files_with_tag(gateway, "valida") == set()
 
 
@@ -163,26 +168,26 @@ def test_deleted_file_cannot_be_modified(gateway, operation):
         operation(gateway, file_id)
 
 
-def test_delete_keeps_the_bytes_shared_with_another_file(gateway):
+def test_delete_keeps_the_bytes_shared_with_another_file(cluster, gateway):
     deleted = gateway.put("playa.jpg", b"bytes compartidos al borrar")
     kept = gateway.put("copia.jpg", b"bytes compartidos al borrar")
 
     gateway.delete(deleted)
 
     assert gateway.get(kept).content == b"bytes compartidos al borrar"
-    assert copies_of(gateway, b"bytes compartidos al borrar") == 2
+    assert copies_of(cluster, b"bytes compartidos al borrar") == 2
 
 
-def test_garbage_collection_removes_the_bytes_of_deleted_files(gateway):
+def test_garbage_collection_removes_the_bytes_of_deleted_files(cluster, gateway):
     file_id = gateway.put("a.jpg", b"bytes para recolectar")
     gateway.delete(file_id)
 
     assert gateway.collect_garbage() >= 1
 
-    assert copies_of(gateway, b"bytes para recolectar") == 0
+    assert copies_of(cluster, b"bytes para recolectar") == 0
 
 
-def test_garbage_collection_keeps_shared_bytes_until_no_file_uses_them(gateway):
+def test_garbage_collection_keeps_shared_bytes_until_no_file_uses_them(cluster, gateway):
     first = gateway.put("playa.jpg", b"bytes compartidos al recolectar")
     second = gateway.put("copia.jpg", b"bytes compartidos al recolectar")
 
@@ -192,32 +197,33 @@ def test_garbage_collection_keeps_shared_bytes_until_no_file_uses_them(gateway):
 
     gateway.delete(second)
     gateway.collect_garbage()
-    assert copies_of(gateway, b"bytes compartidos al recolectar") == 0
+    assert copies_of(cluster, b"bytes compartidos al recolectar") == 0
 
 
-def test_garbage_collection_removes_bytes_left_by_a_failed_put(gateway):
+def test_garbage_collection_removes_bytes_left_by_a_failed_put(cluster, gateway):
     # Simula un put que guardó el contenido y falló antes de crear la ficha.
     gateway._content.put(b"bytes huerfanos")
 
     gateway.collect_garbage()
 
-    assert copies_of(gateway, b"bytes huerfanos") == 0
+    assert copies_of(cluster, b"bytes huerfanos") == 0
 
 
-def test_live_files_are_readable_after_garbage_collection(gateway):
+def test_live_files_are_readable_after_garbage_collection(cluster, gateway):
     file_id = gateway.put("vivo.jpg", b"bytes que sobreviven", {"vivo"})
 
     gateway.collect_garbage()
 
     assert gateway.get(file_id).content == b"bytes que sobreviven"
-    assert copies_of(gateway, b"bytes que sobreviven") == 2
+    assert copies_of(cluster, b"bytes que sobreviven") == 2
 
 
 def test_get_survives_the_death_of_a_storage_node():
-    gateway = Gateway()
+    cluster = start_cluster()
+    gateway = cluster.gateway()
     file_id = gateway.put("playa.jpg", b"bytes replicados", {"foto"})
     first_replica = gateway._content.replicas(content_hash(b"bytes replicados"))[0]
 
-    ray.kill(gateway._storage[first_replica])
+    ray.kill(cluster.storage[first_replica])
 
     assert gateway.get(file_id).content == b"bytes replicados"
