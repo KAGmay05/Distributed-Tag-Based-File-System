@@ -1,7 +1,7 @@
 import pytest
 import ray
 
-from tagfs.gateway import start_ray
+from tagfs.ray_runtime import start_ray
 
 
 @pytest.fixture(scope="session", autouse=True)

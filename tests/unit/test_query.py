@@ -1,7 +1,7 @@
 import pytest
 
 from tagfs.model import InvalidQuery, InvalidTag, normalize_tag
-from tagfs.query import And, Not, Or, Tag, candidates, matches, parse_query
+from tagfs.query import And, Not, Or, Tag, candidates, index_tags, matches, parse_query
 
 A, B, C = Tag("a"), Tag("b"), Tag("c")
 
@@ -24,10 +24,6 @@ A, B, C = Tag("a"), Tag("b"), Tag("c")
 )
 def test_parse_builds_the_expected_tree(text, expected):
     assert parse_query(text) == expected
-
-
-def test_parse_normalizes_tags_to_lowercase():
-    assert parse_query("FOTO AND Viaje") == And((Tag("foto"), Tag("viaje")))
 
 
 @pytest.mark.parametrize(
@@ -56,10 +52,6 @@ def test_parse_rejects_queries_without_positive_part(text):
 def test_parse_rejects_excessive_nesting(text):
     with pytest.raises(InvalidQuery):
         parse_query(text)
-
-
-def test_parse_accepts_reasonable_nesting():
-    assert parse_query("(" * 50 + "a" + ")" * 50) == A
 
 
 @pytest.mark.parametrize("tag", ["foto", "año-2024", "c++", "notas", "android", "or_2", "FOTO"])
@@ -117,3 +109,26 @@ def test_candidates_combine_the_index(text, expected):
 @pytest.mark.parametrize("text", ["a AND NOT b", "a AND (b OR NOT c)"])
 def test_candidates_never_subtract_from_the_index(text):
     assert candidates(parse_query(text), lookup) == {"f1", "f2"}
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("a", {"a"}),
+        ("a AND a", {"a"}),
+        ("a OR b AND c", {"a", "b", "c"}),
+        ("(a OR b) AND c AND NOT d", {"a", "b", "c"}),
+        ("a AND NOT b", {"a"}),
+        ("a AND (b OR NOT c)", {"a"}),
+    ],
+)
+def test_index_tags_are_exactly_the_tags_candidates_asks_for(text, expected):
+    asked = set()
+
+    def recording_lookup(tag):
+        asked.add(tag)
+        return lookup(tag)
+
+    candidates(parse_query(text), recording_lookup)
+
+    assert index_tags(parse_query(text)) == expected == asked

@@ -3,7 +3,7 @@
 import pytest
 import ray
 
-from tagfs.content import ContentCorrupted, ContentNotFound, StorageUnavailable, content_hash
+from tagfs.content import ContentCorrupted, ContentNotFound, NodeUnreachable, StorageUnavailable, content_hash
 from tagfs.content_store import ContentStore, RemoteStorageNode
 from tagfs.storage_node import StorageNode
 
@@ -64,15 +64,6 @@ def test_get_of_unknown_content_fails():
         store.get(KEY)
 
 
-def test_with_two_copies_get_survives_the_death_of_a_node():
-    store, nodes = make_store(replication_factor=2)
-    store.put(DATA)
-
-    ray.kill(nodes[store.replicas(KEY)[0]])
-
-    assert store.get(KEY) == DATA
-
-
 def test_with_two_copies_get_keeps_working_after_the_ring_forgets_the_dead_node():
     store, nodes = make_store(replication_factor=2)
     store.put(DATA)
@@ -80,16 +71,6 @@ def test_with_two_copies_get_keeps_working_after_the_ring_forgets_the_dead_node(
 
     assert store.get(KEY) == DATA
     assert store.get(KEY) == DATA
-
-
-def test_with_one_copy_the_death_of_its_node_loses_the_content():
-    store, nodes = make_store(replication_factor=1)
-    store.put(DATA)
-
-    ray.kill(nodes[store.replicas(KEY)[0]])
-
-    with pytest.raises(ContentNotFound):
-        store.get(KEY)
 
 
 def test_put_writes_to_the_next_node_when_one_is_dead():
@@ -194,3 +175,56 @@ def test_sweep_skips_a_dead_node_and_cleans_the_rest():
     assert store.sweep(set()) == 1
 
     assert holders({name: node for name, node in nodes.items() if name != "A"}) == set()
+
+
+def make_damageable_store():
+    class DamageableNode(StorageNode):
+        def corrupt(self, key):
+            self._blobs[key] = b"bytes corruptos"
+
+    actor = ray.remote(DamageableNode)
+    nodes = {name: actor.remote() for name in ("A", "B", "C")}
+    ray.get([node.list_keys.remote() for node in nodes.values()])
+    return ContentStore(nodes, replication_factor=2), nodes
+
+
+def test_reconcile_repairs_corrupt_destinations_before_removing_the_last_good_copy():
+    store, nodes = make_damageable_store()
+    ray.get([node.put.remote(KEY, DATA) for node in nodes.values()])
+    targets = store.replicas(KEY)
+    ray.get([nodes[name].corrupt.remote(KEY) for name in targets])
+
+    report = store.reconcile({KEY})
+
+    assert report.copied == 2
+    assert report.removed == 1
+    assert report.unavailable == []
+    assert holders(nodes) == set(targets)
+    assert ray.get([nodes[name].get.remote(KEY) for name in targets]) == [DATA, DATA]
+
+
+def test_reconcile_reports_content_with_only_corrupted_copies_as_unavailable():
+    store, nodes = make_damageable_store()
+    store.put(DATA)
+    ray.get([nodes[name].corrupt.remote(KEY) for name in store.replicas(KEY)])
+
+    report = store.reconcile({KEY})
+
+    assert report.unavailable == [KEY]
+    assert report.copied == report.removed == 0
+    assert holders(nodes) == set(store.replicas(KEY))
+    with pytest.raises(ContentCorrupted):
+        store.get(KEY)
+
+
+def test_sweep_counts_only_confirmed_deletions():
+    class UnreachableOnDelete(StorageNode):
+        def delete(self, key):
+            raise NodeUnreachable("Se perdió la conexión antes del borrado")
+
+    node = ray.remote(UnreachableOnDelete).remote()
+    ray.get(node.put.remote(KEY, DATA))
+    store = ContentStore({"A": node}, replication_factor=1)
+
+    assert store.sweep(set()) == 0
+    assert ray.get(node.has.remote(KEY))

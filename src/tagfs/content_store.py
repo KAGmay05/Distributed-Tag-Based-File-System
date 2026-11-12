@@ -8,7 +8,13 @@ from typing import Any, Collection, Mapping, NamedTuple
 import ray
 from ray.exceptions import GetTimeoutError, RayActorError
 
-from tagfs.content import ( ContentCorrupted, ContentNotFound, NodeUnreachable, StorageUnavailable, content_hash,)
+from tagfs.content import (
+    ContentCorrupted,
+    ContentNotFound,
+    NodeUnreachable,
+    StorageUnavailable,
+    content_hash,
+)
 from tagfs.ring import HashRing
 from tagfs.storage_node import StorageNode
 
@@ -96,8 +102,8 @@ class ContentStore:
         live = set(live_keys)
         listings = self._listings()
         garbage = {name: [key for key in keys if key not in live] for name, keys in listings.items()}
-        self._delete(garbage)
-        return len({key for keys in garbage.values() for key in keys})
+        deleted = self._delete(garbage)
+        return len({key for _, key in deleted})
 
     def reconcile(self, live_keys: Collection[str]) -> Reconciliation:
         """Repara el contenido después de fallos o particiones.
@@ -121,19 +127,34 @@ class ContentStore:
             for key in keys:
                 holders[key].add(name)
         garbage = {name: [key for key in keys if key not in live] for name, keys in listings.items()}
-        self._delete(garbage)
-        garbage_count = len({key for keys in garbage.values() for key in keys})
+        deleted = self._delete(garbage)
+        garbage_count = len({key for _, key in deleted})
 
         copied = removed = 0
-        unavailable = sorted(key for key in live if not holders.get(key))
-        for key in sorted(live & holders.keys()):
-            targets = self.replicas(key)
-            missing = [name for name in targets if name not in holders[key]]
-            if missing:
-                data, _ = self._read_first_valid(key, sorted(holders[key] & self._nodes.keys()))
-                if data is None:
-                    unavailable.append(key)
+        unavailable = []
+        for key in sorted(live):
+            # list_keys confirma la presencia de una clave, no su integridad.
+            # Validar las réplicas definitivas antes de borrar las sobrantes.
+            data, _ = self._read_first_valid(key, sorted(holders[key] & self._nodes.keys()))
+            if data is None:
+                unavailable.append(key)
+                continue
+            healthy = set()
+            refs = {self._nodes[name].find.remote(key): name for name in self.replicas(key)}
+            for ref, name in refs.items():
+                try:
+                    replica = ray.get(ref, timeout=self._timeout)
+                except _UNREACHABLE:
+                    self._forget(name)
+                except ContentCorrupted:
                     continue
+                else:
+                    if replica is not None and content_hash(replica) == key:
+                        healthy.add(name)
+            # Una comprobación puede cambiar el anillo: elegir los destinos otra vez.
+            targets = self.replicas(key)
+            missing = [name for name in targets if name not in healthy]
+            if missing:
                 data_ref = ray.put(data)
                 written = self._wait_each({self._nodes[name].put.remote(key, data_ref): name for name in missing})
                 copied += len(written)
@@ -154,14 +175,22 @@ class ContentStore:
                 self._forget(name)
         return listings
 
-    def _delete(self, keys_by_node: Mapping[str, Collection[str]]) -> set[str]:
-        """Borra las claves indicadas de cada nodo; devuelve los nodos que confirmaron."""
+    def _delete(self, keys_by_node: Mapping[str, Collection[str]]) -> set[tuple[str, str]]:
+        """Devuelve cada par (nodo, clave) cuyo borrado fue confirmado."""
         refs = {
-            self._nodes[name].delete.remote(key): name
+            self._nodes[name].delete.remote(key): (name, key)
             for name, keys in keys_by_node.items()
             for key in keys
         }
-        return self._wait_each(refs)
+        deleted = set()
+        for ref, (name, key) in refs.items():
+            try:
+                ray.get(ref, timeout=self._timeout)
+            except _UNREACHABLE:
+                self._forget(name)
+            else:
+                deleted.add((name, key))
+        return deleted
 
     def _wait_each(self, refs: Mapping[Any, str]) -> set[str]:
         """Espera cada respuesta; olvida a los nodos que fallan y devuelve los que respondieron."""
@@ -187,11 +216,16 @@ class ContentStore:
         while pending:
             ready, pending = ray.wait(pending, num_returns=1, timeout=self._timeout)
             if not ready:
+                for ref in pending:
+                    self._forget(refs[ref])
                 break  # ninguno de los nodos restantes respondió a tiempo
             try:
                 data = ray.get(ready[0])
             except _UNREACHABLE:
                 self._forget(refs[ready[0]])
+                continue
+            except ContentCorrupted:
+                corrupted = True
                 continue
             if data is None:
                 continue  # este nodo no lo tiene
