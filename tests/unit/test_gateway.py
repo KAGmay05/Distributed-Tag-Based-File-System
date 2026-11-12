@@ -144,6 +144,65 @@ def test_stored_file_supports_attributes_and_tuple_access():
     assert stored.tags == frozenset()
 
 
+class ClientStopped(Exception):
+    """El cliente se detiene, como si su proceso muriera."""
+
+
+def stop_before_the_index(gateway):
+    # El cliente se cae justo después de que los metadatos aceptan el cambio.
+    def stop(ops):
+        raise ClientStopped
+
+    gateway._send_to_index = stop
+    return gateway
+
+
+def test_a_file_left_out_of_the_index_is_found_after_repair():
+    store = FakeContentStore()
+    gateway, metadata, tags = build_gateway(store)
+    crashing = stop_before_the_index(Gateway(metadata, tags, store))
+
+    with pytest.raises(ClientStopped):
+        crashing.put("a.txt", b"x", {"doc"})
+
+    [file_id] = gateway.list()  # los metadatos lo tienen
+    assert gateway.query("doc") == []  # pero el índice no
+    assert gateway.verify_index() == ([("doc", file_id)], [])
+
+    assert gateway.repair_index() == 1
+
+    assert gateway.query("doc") == [file_id]
+    assert gateway.verify_index() == ([], [])
+    assert gateway.repair_index() == 0  # no quedó nada pendiente
+
+
+@pytest.mark.parametrize(
+    "operation,args,missing_tags,extra_tags",
+    [
+        ("add_tags", ({"urgente"},), ["urgente"], []),
+        ("remove_tags", ({"doc"},), [], ["doc"]),
+        ("delete", (), [], ["doc"]),
+    ],
+)
+def test_a_change_left_out_of_the_index_is_delivered_by_repair(
+    operation, args, missing_tags, extra_tags
+):
+    store = FakeContentStore()
+    gateway, metadata, tags = build_gateway(store)
+    file_id = gateway.put("a.txt", b"x", {"doc"})
+    crashing = stop_before_the_index(Gateway(metadata, tags, store))
+
+    with pytest.raises(ClientStopped):
+        getattr(crashing, operation)(file_id, *args)
+
+    assert gateway.verify_index() == (
+        [(tag, file_id) for tag in missing_tags],
+        [(tag, file_id) for tag in extra_tags],
+    )
+    assert gateway.repair_index() == 1
+    assert gateway.verify_index() == ([], [])
+
+
 @pytest.mark.parametrize("metadata,tags", [([], [TagShard()]), ([MetadataShard()], [])])
 def test_gateway_rejects_empty_injected_shards(metadata, tags):
     with pytest.raises(ValueError):

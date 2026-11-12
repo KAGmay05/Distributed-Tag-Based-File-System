@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
 import ray
+from ray.exceptions import RayActorError
 
 import tagfs
 from tagfs.content_store import ContentStore
@@ -52,11 +53,27 @@ class _MetadataShardActor(_ProcessInfo, MetadataShard):
     pass
 
 
-def _live_files(metadata: Sequence[Any]) -> list[FileMeta]:
-    """Lee a la vez las fichas vivas de todos los shards de metadatos."""
-    ids = ray.get([shard.list_ids.remote() for shard in metadata])
-    answers = ray.get([shard.get_many.remote(found) for shard, found in zip(metadata, ids)])
-    return [meta for answer in answers for meta in answer.values()]
+def _reachable_live_files(metadata_names: Sequence[str]) -> list[FileMeta]:
+    """Lee a la vez las fichas vivas de los shards de metadatos que siguen vivos.
+
+    Se salta los shards muertos, porque sus archivos ya no se pueden leer ni
+    consultar. Si el TagShard fallara aquí, Ray no volvería a reiniciarlo, porque
+    nunca reinicia un actor cuyo __init__ lanzó un error. Se perderían entonces
+    las etiquetas de los archivos de todos los shards, también de los vivos.
+    """
+    refs = []
+    for name in metadata_names:
+        try:
+            refs.append(ray.get_actor(name).live_files.remote())
+        except ValueError:  # el shard murió y Ray ya liberó su nombre
+            continue
+    files: list[FileMeta] = []
+    for ref in refs:
+        try:
+            files.extend(ray.get(ref))
+        except RayActorError:  # murió mientras se le preguntaba
+            continue
+    return files
 
 
 # Un TagShard sí se reinicia, porque su estado se puede reconstruir desde los
@@ -73,10 +90,9 @@ class _TagShardActor(_ProcessInfo, TagShard):
         # Recibe nombres y no handles. Para reiniciar el actor, Ray repite __init__
         # con los mismos argumentos; unos handles irían al almacén de objetos, de
         # donde se pueden perder, y entonces el reinicio fallaría.
-        metadata = [ray.get_actor(name) for name in metadata_names]
         # La primera vez los metadatos están vacíos. Tras un reinicio, Ray vuelve
         # a ejecutar __init__ y así se recupera el índice desde la fuente de verdad.
-        for meta in _live_files(metadata):
+        for meta in _reachable_live_files(metadata_names):
             for tag in meta.tags:
                 if shard_for(tag, shard_count) == index:
                     self.apply(IndexOp(tag, meta.file_id, True, meta.version))

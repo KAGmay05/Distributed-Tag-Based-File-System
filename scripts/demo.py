@@ -21,7 +21,7 @@ import ray  # noqa: E402
 
 from tagfs.content import ContentNotFound, NodeUnreachable, content_hash  # noqa: E402
 from tagfs.gateway import Gateway  # noqa: E402
-from tagfs.ray_runtime import RayCluster, start_cluster, start_ray  # noqa: E402
+from tagfs.ray_runtime import RayCluster, run_in_workers, start_cluster, start_ray  # noqa: E402
 
 CLIENTS = 50
 
@@ -171,8 +171,34 @@ def demo_failures(cluster: RayCluster, gateway: Gateway) -> None:
     print("      se rellenó desde las fichas: sirve igual a todos los clientes")
 
 
+def client_that_dies_halfway(cluster: RayCluster) -> None:
+    gateway = cluster.gateway()
+    # Muere justo después de que los metadatos aceptan el archivo y antes de avisar al índice.
+    gateway._send_to_index = lambda ops: os._exit(1)
+    gateway.put("a-medias.txt", b"guardado a medias", {"a-medias"})
+
+
+def demo_client_crash(gateway: Gateway, cluster: RayCluster) -> None:
+    title("9. Un cliente se cae a mitad de un cambio")
+    step("Un cliente guarda un archivo y se cae antes de avisar al índice")
+    try:
+        run_in_workers(client_that_dies_halfway, [(cluster,)])
+    except ray.exceptions.WorkerCrashedError:
+        print("    (si Ray avisa de que un worker murió, es esta caída simulada)")
+    saved = any(gateway.get(file_id).name == "a-medias.txt" for file_id in gateway.list())
+    show("¿Los metadatos tienen el archivo?", saved)
+    show("Archivos con 'a-medias' según query", len(gateway.query("a-medias")))
+    show("Entradas que faltan en el índice", len(gateway.verify_index().missing))
+    step("Otro cliente entrega los cambios pendientes (repair_index)")
+    show("Cambios pendientes entregados", gateway.repair_index())
+    show("Archivos con 'a-medias' según query", len(gateway.query("a-medias")))
+    show("Entradas que faltan en el índice", len(gateway.verify_index().missing))
+    print("    → el cambio quedó apuntado en el outbox de su shard de metadatos,")
+    print("      y cualquier cliente lo pudo entregar después")
+
+
 def demo_partition() -> None:
-    title("9. Partición de red: un almacén queda aislado y después vuelve")
+    title("10. Partición de red: un almacén queda aislado y después vuelve")
     cluster = start_cluster()
     gateway = cluster.gateway()
     before = [gateway.put(f"antes-{i}.txt", f"antes {i}".encode(), {"red"}) for i in range(10)]
@@ -209,7 +235,7 @@ def add_tag(cluster: RayCluster, file_id: str, tag: str) -> int:
 
 
 def demo_concurrency(cluster: RayCluster, gateway: Gateway) -> None:
-    title(f"10. {CLIENTS} clientes cambian el mismo archivo a la vez")
+    title(f"11. {CLIENTS} clientes cambian el mismo archivo a la vez")
     file_id = gateway.put("compartido.txt", b"archivo compartido", set())
     remote_add = ray.remote(max_retries=0)(add_tag)
     started = time.time()
@@ -234,6 +260,7 @@ def main() -> None:
         show("Almacenes (StorageNode)", len(cluster.storage))
         demo_operations(cluster, gateway)
         demo_failures(cluster, gateway)
+        demo_client_crash(gateway, cluster)
         demo_partition()
         demo_concurrency(cluster, gateway)
         print("\nFin de la demostración.")

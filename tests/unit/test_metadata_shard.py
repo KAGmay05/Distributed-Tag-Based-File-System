@@ -126,3 +126,53 @@ def test_listing_and_batch_read_hide_deleted_files(shard):
 
     assert shard.list_ids() == ["f2"]
     assert list(shard.get_many(["f1", "f2", "desconocido"])) == ["f2"]
+    assert [meta.file_id for meta in shard.live_files()] == ["f2"]
+
+
+def test_changes_wait_in_the_outbox_until_ack():
+    shard = MetadataShard()
+    shard.create("f1", "a.jpg", {"foto"}, "hash-1")
+    shard.add_tags("f1", {"viaje"})
+
+    assert list(shard.pending()) == [("f1", 1), ("f1", 2)]
+
+    shard.ack([("f1", 1)])
+    assert list(shard.pending()) == [("f1", 2)]
+
+    shard.ack([("f1", 2), ("f1", 2), ("desconocido", 7)])  # repetir un ack no falla
+    assert shard.pending() == {}
+
+
+def test_changes_that_do_not_touch_the_index_leave_nothing_pending(shard):
+    shard.ack(list(shard.pending()))
+
+    shard.create("f2", "sin-etiquetas.txt", set(), "hash-2")
+    shard.rename("f1", "costa.jpg")
+    shard.add_tags("f1", {"FOTO"})
+    shard.remove_tags("f1", {"inexistente"})
+
+    assert shard.pending() == {}
+
+
+def test_pending_changes_carry_the_current_state_of_each_tag():
+    shard = MetadataShard()
+    shard.create("f1", "a.jpg", {"foto"}, "hash-1")
+    shard.ack([("f1", 1)])
+    shard.add_tags("f1", {"viaje"})  # versión 2, sin entregar
+    shard.remove_tags("f1", {"viaje"})  # versión 3, sin entregar
+
+    # Un TagShard reconstruido no recuerda que "viaje" se quitó: si recibiera el
+    # cambio de la versión 2 tal cual, volvería a ponerla.
+    assert shard.pending() == {
+        ("f1", 2): (IndexOp("viaje", "f1", False, 3),),
+        ("f1", 3): (IndexOp("viaje", "f1", False, 3),),
+    }
+
+
+def test_pending_changes_of_a_deleted_file_take_it_out_of_the_index(shard):
+    shard.delete("f1")
+
+    assert shard.pending()[("f1", 1)] == (
+        IndexOp("foto", "f1", False, 2),
+        IndexOp("viaje", "f1", False, 2),
+    )

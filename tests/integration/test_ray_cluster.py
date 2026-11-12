@@ -75,10 +75,10 @@ def test_concurrent_tag_changes_on_one_file_stay_consistent(cluster):
         class DelayedGateway(Gateway):
             # Retrasa cada entrega como lo haría una red real: sin esto, los cambios
             # casi nunca llegan desordenados y la carrera no llegaría a ocurrir.
-            def _deliver(self, index_ops):
+            def _send_to_index(self, index_ops):
                 for op in index_ops:
                     time.sleep(random.uniform(0, max_delay))
-                    super()._deliver([op])
+                    super()._send_to_index([op])
 
         started = time.time()
         gateway = DelayedGateway(

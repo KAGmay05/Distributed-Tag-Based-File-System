@@ -152,6 +152,17 @@ class GatewayContract:
         assert gateway.collect_garbage() == 1  # b"solo"; b"igual" lo sigue usando second
         assert gateway.get(second).content == b"igual"
 
+    def test_index_matches_metadata_after_every_kind_of_change(self, gateway):
+        kept = gateway.put("a.txt", b"x", {"doc", "foto"})
+        changed = gateway.put("b.txt", b"y", {"doc"})
+        gateway.add_tags(kept, {"urgente"})
+        gateway.remove_tags(kept, {"foto"})
+        gateway.rename(kept, "c.txt")
+        gateway.delete(changed)
+
+        assert gateway.verify_index() == ([], [])
+        assert gateway.repair_index() == 0  # todo llegó al índice: no queda nada pendiente
+
     def test_reconcile_without_failures_changes_nothing(self, gateway):
         file_id = gateway.put("a.txt", b"x", {"doc"})
 

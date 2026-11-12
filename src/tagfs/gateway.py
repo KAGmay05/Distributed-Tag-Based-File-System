@@ -8,13 +8,17 @@ from typing import Any, Collection, Iterable, NamedTuple, Protocol, Sequence
 
 import ray
 from ray.actor import ActorHandle
-from ray.exceptions import GetTimeoutError
+from ray.exceptions import GetTimeoutError, RayActorError
 
 from tagfs.content import ContentCorrupted, content_hash
 from tagfs.content_store import Reconciliation
-from tagfs.model import FileId, FileMeta, IndexOp, normalize_tags
+from tagfs.model import FileId, FileMeta, IndexOp, Mutation, normalize_tags
 from tagfs.query import candidates, index_tags, matches, parse_query
 from tagfs.router import shard_for
+from tagfs.tag_shard import IndexCheck, check_index
+
+# Un TagShard muerto que no se pudo reiniciar, o uno que no respondió ni después de reiniciarlo.
+_INDEX_UNAVAILABLE = (RayActorError, GetTimeoutError)
 
 
 class ContentAPI(Protocol):
@@ -53,7 +57,10 @@ class Gateway:
     Cada cliente tiene su propio Gateway; todos comparten los mismos actores.
 
     Los metadatos son la fuente de verdad y el índice se deriva de ellos: un
-    cambio está hecho en cuanto lo aceptan los metadatos.
+    cambio está hecho en cuanto lo aceptan los metadatos. El shard de metadatos lo
+    apunta en su outbox hasta que el gateway confirma que llegó al índice. Si el
+    cliente se cae antes, o el índice no responde, el cambio sigue apuntado y
+    repair_index, desde cualquier cliente, lo entrega después.
 
     Si un TagShard no responde a tiempo, el gateway pide a Ray que lo reinicie.
     Los TagShard de start_cluster se reinician con el mismo handle y se rellenan
@@ -93,9 +100,7 @@ class Gateway:
         file_id = str(uuid.uuid4())
         stored_hash = self._content.put(content)
         _verify(content, stored_hash)
-        shard = self._metadata_for(file_id)
-        mutation = self._resolve(self._call(shard, "create", file_id, name, normalized, stored_hash))
-        self._deliver(mutation.index_ops)
+        self._change(file_id, "create", name, normalized, stored_hash)
         return file_id
 
     def get(self, file_id: FileId) -> StoredFile:
@@ -111,21 +116,19 @@ class Gateway:
         Los bytes no se borran aquí: otro archivo puede compartir el mismo
         contenido. Se encargará el recolector de basura.
         """
-        self._commit(self._call(self._metadata_for(file_id), "delete", file_id))
+        self._change(file_id, "delete")
 
     def add_tags(self, file_id: FileId, tags: Iterable[str]) -> int:
         """Agrega etiquetas y devuelve la nueva versión del archivo."""
-        return self._commit(self._call(self._metadata_for(file_id), "add_tags", file_id, tuple(tags)))
+        return self._change(file_id, "add_tags", tuple(tags))
 
     def remove_tags(self, file_id: FileId, tags: Iterable[str]) -> int:
         """Quita etiquetas y devuelve la nueva versión del archivo."""
-        return self._commit(
-            self._call(self._metadata_for(file_id), "remove_tags", file_id, tuple(tags))
-        )
+        return self._change(file_id, "remove_tags", tuple(tags))
 
     def rename(self, file_id: FileId, new_name: str) -> int:
         """Cambia el nombre y devuelve la nueva versión del archivo."""
-        return self._commit(self._call(self._metadata_for(file_id), "rename", file_id, new_name))
+        return self._change(file_id, "rename", new_name)
 
     def query(self, expr: str) -> list[FileId]:
         """Devuelve, ordenados, los archivos vivos que cumplen la consulta.
@@ -165,6 +168,36 @@ class Gateway:
         live = {meta.content_hash for meta in self._live_files()}
         return self._content.reconcile(live)
 
+    def repair_index(self) -> int:
+        """Entrega al índice los cambios que quedaron pendientes en los metadatos.
+
+        Un cambio queda pendiente si su cliente se cayó después de que lo
+        aceptaran los metadatos y antes de avisar al índice, o si el índice no
+        respondió. Devuelve cuántos cambios entregó. Se puede llamar en cualquier
+        momento, también con escrituras en curso: entregar dos veces un cambio
+        no tiene efecto.
+        """
+        pending = self._resolve([self._call(shard, "pending") for shard in self._metadata])
+        self._send_to_index({op for changes in pending for ops in changes.values() for op in ops})
+        self._resolve(
+            [
+                self._call(shard, "ack", list(changes))
+                for shard, changes in zip(self._metadata, pending)
+                if changes
+            ]
+        )
+        return sum(len(changes) for changes in pending)
+
+    def verify_index(self) -> IndexCheck:
+        """Compara el índice con el que se obtendría desde los metadatos.
+
+        No cambia nada. Con escrituras en curso puede ver diferencias pasajeras.
+        """
+        index: dict[str, set[FileId]] = {}
+        for entries in self._ask_every_tag_shard("entries"):
+            index.update(entries)
+        return check_index(self._live_files(), index)
+
     def _lookup_many(self, tags: Iterable[str]) -> dict[str, set[FileId]]:
         """Devuelve los archivos de cada etiqueta, pidiéndolas todas antes de esperar."""
         if not self._remote:
@@ -192,13 +225,27 @@ class Gateway:
             files.update(answer)
         return files
 
-    def _commit(self, mutation_ref: Any) -> int:
-        # Espera el cambio de metadatos y lleva al índice lo que haya cambiado.
-        mutation = self._resolve(mutation_ref)
-        self._deliver(mutation.index_ops)
+    def _change(self, file_id: FileId, method: str, *args: Any) -> int:
+        """Hace un cambio en los metadatos, lo lleva al índice y devuelve la versión."""
+        shard = self._metadata_for(file_id)
+        mutation = self._resolve(self._call(shard, method, file_id, *args))
+        if mutation.index_ops:
+            self._deliver(shard, file_id, mutation)
         return mutation.version
 
-    def _deliver(self, ops: Iterable[IndexOp]) -> None:
+    def _deliver(self, shard: Any, file_id: FileId, mutation: Mutation) -> None:
+        """Lleva un cambio al índice y lo saca del outbox de su shard de metadatos.
+
+        Si el índice no responde, no se lanza error: el cambio ya está hecho
+        porque lo aceptaron los metadatos, y sigue en el outbox para repair_index.
+        """
+        try:
+            self._send_to_index(mutation.index_ops)
+        except _INDEX_UNAVAILABLE:
+            return
+        self._resolve(self._call(shard, "ack", [(file_id, mutation.version)]))
+
+    def _send_to_index(self, ops: Iterable[IndexOp]) -> None:
         if not self._remote:
             for op in ops:
                 self._tag_shard_for(op.tag).apply(op)
@@ -224,10 +271,16 @@ class Gateway:
             ray.kill(self._tags[index], no_restart=False)
             return ray.get(refs, timeout=self._restart_timeout)
 
+    def _ask_every_tag_shard(self, method: str) -> list[Any]:
+        """Hace la misma pregunta a todos los TagShard a la vez."""
+        if not self._remote:
+            return [getattr(shard, method)() for shard in self._tags]
+        sent = [getattr(shard, method).remote() for shard in self._tags]
+        return [self._wait_for_index(index, [ref])[0] for index, ref in enumerate(sent)]
+
     def _live_files(self) -> list[FileMeta]:
-        ids = self._resolve([self._call(shard, "list_ids") for shard in self._metadata])
-        refs = [self._call(shard, "get_many", shard_ids) for shard, shard_ids in zip(self._metadata, ids)]
-        return [meta for answer in self._resolve(refs) for meta in answer.values()]
+        answers = self._resolve([self._call(shard, "live_files") for shard in self._metadata])
+        return [meta for files in answers for meta in files]
 
     def _call(self, target: Any, method: str, *args: Any) -> Any:
         function = getattr(target, method)

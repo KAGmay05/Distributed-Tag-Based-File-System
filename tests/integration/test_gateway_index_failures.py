@@ -9,13 +9,15 @@ Las clases que corren en workers se definen dentro de cada test: así Ray las
 envía por valor, porque los workers no pueden importar este módulo.
 """
 
+import os
 import time
 
 import pytest
 import ray
 
 from tagfs.gateway import Gateway
-from tagfs.ray_runtime import start_cluster
+from tagfs.ray_runtime import run_in_workers, start_cluster
+from tagfs.tag_shard import TagShard
 
 
 @pytest.fixture(scope="module")
@@ -31,6 +33,32 @@ def gateway(cluster):
 def crash_index_of(gateway, tag):
     # Como si se cayera el proceso del actor: Ray lo vuelve a arrancar.
     ray.kill(gateway._tag_shard_for(tag), no_restart=False)
+
+
+# ray.kill no espera a que el actor muera: hasta entonces puede seguir respondiendo.
+# Estas dos funciones esperan a que la caída o el reinicio hayan ocurrido de verdad.
+
+
+def wait_until_dead(actor, seconds=30):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            ray.get(actor.pid.remote(), timeout=seconds)
+        except ray.exceptions.RayActorError:
+            return
+        time.sleep(0.1)
+    raise TimeoutError("El actor no murió")
+
+
+def crash_index_and_wait_for_restart(gateway, tag, seconds=60):
+    shard = gateway._tag_shard_for(tag)
+    before = ray.get(shard.pid.remote())
+    crash_index_of(gateway, tag)
+    deadline = time.monotonic() + seconds
+    while ray.get(shard.pid.remote(), timeout=seconds) == before:
+        if time.monotonic() > deadline:
+            raise TimeoutError("El TagShard no se reinició")
+        time.sleep(0.1)
 
 
 def raw_index(gateway, tag):
@@ -151,3 +179,57 @@ def test_a_tag_shard_that_stops_answering_is_restarted(cluster):
 
     assert gateway.query("i7-doc") == []
     assert ray.get(starts.read.remote()) == 2  # se reinició una vez
+
+
+def test_a_tag_shard_restarts_even_after_a_metadata_shard_died():
+    # Usa su propio clúster: matar un MetadataShard es definitivo.
+    gateway = start_cluster().gateway()
+    dead = gateway._metadata[0]
+    ids = []
+    while sum(gateway._metadata_for(f) is dead for f in ids) < 2 or len(ids) < 10:
+        ids.append(gateway.put(f"{len(ids)}.txt", b"x", {"i8-doc"}))
+    kept = sorted(f for f in ids if gateway._metadata_for(f) is not dead)
+    ray.kill(dead)
+    wait_until_dead(dead)
+
+    crash_index_and_wait_for_restart(gateway, "i8-doc")  # al arrancar se salta el shard muerto
+
+    assert raw_index(gateway, "i8-doc") == set(kept)
+    assert gateway.query("i8-doc") == kept
+    assert gateway.remove_tags(kept[0], {"i8-doc"}) == 2
+    assert gateway.query("i8-doc") == kept[1:]
+
+
+def test_a_change_the_index_did_not_receive_is_delivered_by_repair(cluster):
+    unreachable = ray.remote(TagShard).remote()
+    ray.kill(unreachable)  # muerte definitiva: este índice no vuelve
+    cut_off = Gateway([p.handle for p in cluster.metadata], [unreachable], cluster.content_store())
+
+    file_id = cut_off.put("a.txt", b"x", {"i9-doc"})  # no falla: los metadatos lo aceptaron
+
+    gateway = cluster.gateway()
+    assert gateway.get(file_id).name == "a.txt"
+    assert gateway.query("i9-doc") == []
+    assert gateway.repair_index() >= 1
+    assert gateway.query("i9-doc") == [file_id]
+    assert gateway.repair_index() == 0
+
+
+def test_a_client_that_dies_before_telling_the_index_is_repaired(cluster):
+    def client_that_dies_halfway(cluster):
+        gateway = cluster.gateway()
+        gateway._send_to_index = lambda ops: os._exit(1)  # muere justo antes de avisar al índice
+        gateway.put("a-medias.txt", b"x", {"i10-doc"})
+
+    with pytest.raises(ray.exceptions.WorkerCrashedError):
+        run_in_workers(client_that_dies_halfway, [(cluster,)])
+
+    gateway = cluster.gateway()
+    [file_id] = [f for f in gateway.list() if gateway.get(f).name == "a-medias.txt"]
+    assert gateway.query("i10-doc") == []
+    assert ("i10-doc", file_id) in gateway.verify_index().missing
+
+    gateway.repair_index()
+
+    assert gateway.query("i10-doc") == [file_id]
+    assert gateway.verify_index() == ([], [])
