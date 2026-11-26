@@ -394,6 +394,25 @@ operativo. Matar un actor simula la pérdida de un proceso, no de una máquina. 
 tiempos incluyen el arranque de tasks y el scheduling de Ray; no son una medida
 de rendimiento.
 
+### Experimento: un TagShard colgado
+
+Se guardan archivos con una etiqueta, se cuelga el `TagShard` de esa etiqueta y
+se consulta hasta obtener la respuesta correcta. El shard se cuelga con una
+llamada que duerme una hora, enviada con `max_task_retries=0`. Sin esa opción,
+Ray repetiría también el cuelgue en el actor nuevo y no se recuperaría nunca. Se
+ejecuta 3 veces sin fallo (control) y 3 con fallo, con la configuración por
+defecto: 4 shards de cada tipo, factor 2, `index_timeout` de 5 s.
+
+Predicción, escrita antes de ejecutar nada:
+
+| Medida | Control | Con fallo | Por qué |
+| --- | --- | --- | --- |
+| Tiempo hasta la primera consulta correcta | Menos de 0,1 s | Entre 7 y 10 s | El gateway espera `index_timeout` (5 s), mata el shard para que Ray lo reinicie y espera al actor nuevo: arrancar un proceso de Python, importar `tagfs` y leer los 4 shards de metadatos |
+| Archivos perdidos | 0 | 0 | El actor nuevo rellena el índice desde los metadatos, que no se tocan |
+| PID del shard | No cambia | Cambia | Ray arranca el actor en otro proceso |
+| `verify_index()` al terminar | Sin diferencias | Sin diferencias | El índice reconstruido es exactamente el de los metadatos |
+| Consulta a otro shard durante el cuelgue | Menos de 0,1 s | Igual que en el control | El gateway no pasa por el shard colgado |
+
 ## Retirada de Ray
 
 Cada fila completa la frase "Ray me permite expresar ___; debajo necesita ___; mi
