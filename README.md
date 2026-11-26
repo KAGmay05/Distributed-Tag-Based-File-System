@@ -84,10 +84,11 @@ Errores que ve el cliente:
 | `ContentNotFound` | La ficha existe, pero ninguna réplica alcanzable tiene los bytes |
 | `ContentCorrupted` | Los bytes no coinciden con su hash |
 | `StorageUnavailable` | Ningún almacén pudo guardar el contenido de un `put` |
-| `RayActorError`, `GetTimeoutError` | Murió un shard de metadatos que la operación necesita, o un shard de etiquetas no respondió ni después de reiniciarlo |
+| `ServiceUnavailable` | Un shard de metadatos que la operación necesita murió o no respondió en `metadata_timeout` (10 s), o un shard de etiquetas no respondió ni después de reiniciarlo. Si ocurre durante un cambio, el cambio puede haberse hecho o no |
 
-Los dos últimos son tipos de Ray que se filtran al contrato. La versión nativa
-debe sustituirlos por un error propio de servicio no disponible.
+Todos son subclases de `TagFSError` y ninguno es un tipo de Ray: el gateway
+traduce los errores de Ray antes de que lleguen al cliente, así que el contrato
+no cambia al quitar Ray.
 
 ## Arquitectura
 
@@ -299,7 +300,7 @@ protege contra la pérdida de un proceso, no de una máquina.
 | --- | --- | --- |
 | Cliente (task) | `max_retries=0`; por defecto Ray la repetiría hasta 3 veces | Ray no la repite y quien la espera recibe `WorkerCrashedError`. Los demás clientes siguen |
 | `TagShard` | `max_restarts=-1`, `max_task_retries=-1` | Ray lo arranca en otro proceso con el mismo handle, lo rellena desde los metadatos y repite las llamadas que estaban en curso |
-| `MetadataShard` | Valores por defecto: ni reinicio ni reintentos | Sus archivos quedan inaccesibles y quien los pide recibe `RayActorError`. Es a propósito: un shard nuevo empezaría vacío y diría que sus archivos no existen |
+| `MetadataShard` | Valores por defecto: ni reinicio ni reintentos | Sus archivos quedan inaccesibles y quien los pide recibe `ServiceUnavailable`. Es a propósito: un shard nuevo empezaría vacío y diría que sus archivos no existen |
 | `StorageNode` | Valores por defecto | El `ContentStore` de cada cliente lo saca de su anillo al detectarlo; `reconcile()` lo readmite si vuelve |
 | Proceso que llamó a `start_cluster()` | Los actores no son *detached* | Ray destruye todos los actores, porque pertenecen a ese proceso |
 
@@ -330,9 +331,9 @@ cuenta tras perder la respuesta también crea otro archivo.
 Límites conocidos:
 
 - No hay persistencia ni réplicas de los metadatos.
-- Las llamadas a los shards de metadatos no tienen timeout. Uno colgado, pero
-  vivo, bloquea a todos los clientes que lo necesiten; `list()`, las consultas,
-  la recolección y `repair_index()` los necesitan todos.
+- Un shard de metadatos colgado, pero vivo, no se reinicia: cada operación que
+  lo necesite falla con `ServiceUnavailable` tras `metadata_timeout` (10 s).
+  `list()`, las consultas, la recolección y `repair_index()` los necesitan todos.
 - Contenido y metadatos no se escriben de forma atómica: una caída entre los dos
   pasos deja bytes huérfanos hasta la siguiente recolección.
 - `repair_index()` y `reconcile()` hay que llamarlos a mano.
