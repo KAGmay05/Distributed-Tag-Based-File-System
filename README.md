@@ -482,3 +482,40 @@ Preguntas abiertas:
   o hace falta una membresía compartida?
 - ¿Quién reinicia un shard de etiquetas caído, y qué hace un cliente con uno que
   responde lento pero sigue vivo?
+
+## Exit gate de la Fase 1
+
+### 4. ¿Qué viene de Ray?
+
+El [mapa de dependencias](#retirada-de-ray) lo detalla por requisito. En resumen:
+
+- **Lo que Ray da y la versión nativa tendrá que construir:** ejecución remota
+  con plazos y errores, un proceso con su estado y su cola de llamadas para cada
+  shard y almacén, el reinicio del `TagShard` con la misma identidad, la
+  búsqueda de los shards por nombre y el envío de los bytes a varias réplicas
+  con una sola serialización.
+- **Lo que Ray da y no hará falta:** un scheduler general, un almacén de
+  resultados y la recomputación por linaje. Qué nodo guarda cada clave ya lo
+  decide la aplicación, y ningún resultado sobrevive a su operación.
+- **Lo que Ray no da y hoy falta:** persistencia de los metadatos, réplicas en
+  máquinas distintas, deduplicación de un `put` reintentado y un monitoreo que
+  siga una petición de punta a punta. Hoy solo hay PIDs y logs de Ray.
+- **Lo que ya no se filtra al cliente:** ningún error de Ray llega al contrato;
+  el gateway los traduce a `ServiceUnavailable` o al error original.
+
+### 5. ¿Qué observamos y qué suponemos?
+
+Observado es lo que reproduce una prueba o un experimento del repositorio.
+Supuesto es lo que deducimos del código y de la documentación de Ray, sin
+haberlo provocado.
+
+| Escenario | Tipo | Qué pasa | Evidencia |
+| --- | --- | --- | --- |
+| Un `TagShard` se reinicia | Observado | Ray lo arranca en otro proceso y lo rellena desde los metadatos. Colgado, la primera consulta tarda unos 9 s y devuelve todo: 0 archivos perdidos y el cliente no ve ningún error | [Experimento del TagShard colgado](#experimento-un-tagshard-colgado) (6 JSON); [test_gateway_index_failures.py](tests/integration/test_gateway_index_failures.py) |
+| Un shard de metadatos colgado | Observado | No se reinicia. Cada operación que lo necesita falla con `ServiceUnavailable` tras `metadata_timeout`, y `list()`, las consultas y la recolección lo necesitan siempre | [test_gateway_errors.py](tests/integration/test_gateway_errors.py) `test_hung_metadata_shard_raises_service_unavailable_in_time`: con 1 s de plazo, cada operación falla en menos de 6 s |
+| Recolectar durante un `put` | Observado | La recolección borra los bytes de un `put` que aún no tiene ficha. Ese archivo queda con ficha pero sin contenido: 22 de 800 archivos perdidos | Observación del equipo; falta el script o el JSON que la reproduzca en el repositorio. El riesgo está documentado en `collect_garbage()` |
+| Lectura con un almacén caído | Observado | Con factor 2, todo sigue legible y los `put` nuevos guardan 2 copias en los almacenes vivos. Al caer las dos réplicas, el contenido se pierde pero la ficha sigue: el archivo aparece en `list()` y en las consultas, y `get` da `ContentNotFound` | [test_end_to_end.py](tests/integration/test_end_to_end.py) `test_storage_nodes_fail_one_after_another`; [test_gateway_files.py](tests/integration/test_gateway_files.py) `test_get_survives_the_death_of_a_storage_node`; demo: 20 de 20 legibles con factor 2 y 14 de 20 con factor 1 |
+| Cae una máquina | Supuesto | Se pierde todo lo que corre en ella. En local son todos los actores; con varias máquinas, nada impide que las dos réplicas de un contenido estén en la misma | Ninguna: todo corre en una máquina, y matar un actor solo simula perder un proceso |
+| Cae el GCS | Supuesto | Sin tolerancia a fallos del GCS, Ray no puede reiniciar actores, crear otros ni resolver nombres: un `TagShard` que muera no volvería | Ninguna: no se ha provocado. Se deduce de la documentación de Ray |
+| Partición de red real | Supuesto | Un almacén aislado se comporta como uno que rechaza peticiones: se saca del anillo y `reconcile()` lo readmite al volver | Solo simulada: `disconnect()` hace que el almacén rechace peticiones, pero no toca la red. [test_partitions.py](tests/integration/test_partitions.py) |
+| Metadatos o índice aislados | Supuesto | Unos metadatos aislados se verían como colgados: `ServiceUnavailable` tras `metadata_timeout`. Un índice aislado no respondería a tiempo y el gateway pediría reiniciarlo. Si el `ray.kill` no le llega, porque también está aislado del GCS, las consultas fallarían tras `restart_timeout` (120 s); los cambios no se pierden, quedan en el outbox | Ninguna: `disconnect()` solo existe en los almacenes |
