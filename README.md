@@ -136,6 +136,72 @@ las fichas de los candidatos y se queda con los que cumplen la expresión según
 sus etiquetas actuales. Así se descartan los falsos positivos de un índice
 atrasado, pero no se recuperan los archivos que le falten.
 
+### Procesos y piezas de Ray
+
+Los componentes de arriba viven en procesos que crea y vigila Ray. Estas son
+las piezas de Ray que intervienen:
+
+| Pieza de Ray | Qué es | Qué hace en este sistema |
+| --- | --- | --- |
+| Driver | El proceso que llama a `start_cluster()`: el script de la demo o pytest | Es dueño de los actores: si termina, Ray los destruye todos. Guarda el `RayCluster` y puede ser también un cliente |
+| Workers | Procesos de Python que arranca Ray | Uno por cada uno de los 12 actores, otro por cada cliente de `run_in_workers()` y otro para `_StartBarrier` |
+| GCS | El registro central del clúster, en el nodo principal | Apunta cada actor y su nombre, detecta cuándo muere y ordena reiniciarlo. Atiende `ray.get_actor()` y `ray.kill()` |
+| Raylet | Un proceso por máquina | Arranca los workers que pide el GCS y les asigna CPU; sin CPU libre, un actor no se coloca |
+| Object store | Memoria compartida de cada máquina, gestionada por su raylet | Guarda los bytes del `ray.put` de `ContentStore` hasta que los leen las réplicas, y los resultados grandes |
+
+```mermaid
+flowchart TB
+    subgraph maquina[Máquina: un nodo de Ray]
+        subgraph driver[Proceso driver]
+            SC[start_cluster + RayCluster]
+            GD[Gateway + ContentStore del driver]
+        end
+        subgraph clientes[Workers de clientes]
+            GC[Gateway + ContentStore de cada cliente]
+        end
+        subgraph actores[12 workers de actores]
+            MS[4 MetadataShard]
+            TS[4 TagShard]
+            SN[4 StorageNode]
+        end
+        RL[Raylet]
+        OS[(Object store)]
+    end
+    GCS[GCS: actores, nombres, muertes y reinicios]
+
+    SC -- crea actores --> GCS
+    GCS -- pide procesos --> RL
+    RL -- arranca --> actores
+    RL -- arranca --> clientes
+    TS -- busca shards por nombre al arrancar --> GCS
+    GD & GC -- llamadas a métodos --> MS & TS & SN
+    GD & GC -- ray.put de los bytes --> OS
+    OS -- los lee --> SN
+    GD & GC -- ray.kill de un TagShard colgado --> GCS
+```
+
+En una ejecución local todo está en la misma máquina: un raylet, un object store
+y el GCS. Con varias máquinas, cada una tendría su raylet y su object store, y el
+GCS seguiría siendo uno solo.
+
+De cada componente nuestro, en qué proceso vive y de qué pieza de Ray depende:
+
+| Componente | Proceso | Depende de | Para qué |
+| --- | --- | --- | --- |
+| `start_cluster()` y `RayCluster` | Driver | GCS y raylet | Registrar los actores, darles nombre y esperar a que arranquen |
+| `Gateway` | El del cliente: el driver o un worker de cliente | Workers de los actores | Llamar a sus métodos con `.remote()` y esperar con `ray.get` |
+| `ContentStore` | El del cliente, dentro de su gateway | Object store | Enviar los bytes una sola vez aunque vayan a varias réplicas |
+| `MetadataShard` | Su propio worker, uno por shard | Raylet | Que exista el proceso; si muere, nadie lo vuelve a arrancar |
+| `TagShard` | Su propio worker, uno por shard | GCS | Reiniciarlo con el mismo handle y encontrar los shards de metadatos por nombre |
+| `StorageNode` | Su propio worker, uno por almacén | Object store | Recibir los bytes del `ray.put` |
+| Clientes de `run_in_workers()` | Un worker por cliente | Raylet | Arrancarlos a la vez; declaran `num_cpus=0` para no esperar CPU |
+| `_StartBarrier` | Su propio worker | Raylet | Solo para pruebas y demos: que los clientes empiecen juntos |
+
+Lo que hoy da por hecho el código y no da ningún componente nuestro: que los
+actores tengan nombre (GCS), que un `TagShard` muerto vuelva (GCS) y que haya un
+proceso para cada actor (raylet). La versión nativa tendrá que dar cada una de
+estas cosas por su cuenta.
+
 ## Qué hace Ray en este prototipo
 
 ### Tasks y actores
