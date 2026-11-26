@@ -1,0 +1,340 @@
+"""Gateway: lo que usa cada cliente para trabajar con el sistema."""
+
+from __future__ import annotations
+
+import uuid
+from collections import defaultdict
+from typing import Any, Collection, Iterable, NamedTuple, Protocol, Sequence
+
+import ray
+from ray.actor import ActorHandle
+from ray.exceptions import GetTimeoutError, RayActorError, RayTaskError
+
+from tagfs.content import ContentCorrupted, content_hash
+from tagfs.content_store import Reconciliation
+from tagfs.model import (
+    FileId,
+    FileMeta,
+    IndexOp,
+    Mutation,
+    ServiceUnavailable,
+    TagFSError,
+    normalize_tags,
+)
+from tagfs.query import candidates, index_tags, matches, parse_query
+from tagfs.router import shard_for
+from tagfs.tag_shard import IndexCheck, check_index
+
+class ContentAPI(Protocol):
+    """Lo que el gateway necesita de un almacén de contenido."""
+
+    def put(self, content: bytes) -> str: ...
+
+    def get(self, content_hash: str) -> bytes: ...
+
+    def sweep(self, live_keys: Collection[str]) -> int: ...
+
+    def reconcile(self, live_keys: Collection[str]) -> Reconciliation: ...
+
+
+def _verify(content: bytes, expected_hash: str) -> None:
+    if content_hash(content) != expected_hash:
+        raise ContentCorrupted(expected_hash)
+
+
+def _get(refs: Any, timeout: float, what: str) -> Any:
+    """ray.get que traduce los errores de Ray a los del sistema.
+
+    Un error de nuestro código lanzado dentro de un actor llega envuelto en un
+    RayTaskError que también hereda de la clase original y trae en el mensaje el
+    PID y la IP del worker. Se lanza el original, sin envoltorio. Un actor muerto
+    o que no responde a tiempo se convierte en ServiceUnavailable.
+
+    No se captura RayError en general: el RayTaskError de un FileNotFound también
+    lo es, y se convertiría en ServiceUnavailable.
+    """
+    try:
+        return ray.get(refs, timeout=timeout)
+    except RayTaskError as error:
+        if isinstance(error.cause, TagFSError):
+            raise error.cause from None
+        raise
+    except (RayActorError, GetTimeoutError) as error:
+        raise ServiceUnavailable(f"{what} no responde") from error
+
+
+class StoredFile(NamedTuple):
+    """Archivo completo tal como lo recibe el cliente."""
+
+    name: str
+    content: bytes
+    tags: frozenset[str]
+    version: int
+
+
+class Gateway:
+    """Lo que usa un cliente para trabajar con el sistema.
+
+    Recibe los shards de metadatos y de etiquetas y un almacén de contenido. Los
+    shards son handles de actores de Ray, como los que crea start_cluster en
+    tagfs.ray_runtime, u objetos locales para probar la lógica sin Ray. Con
+    actores, las peticiones independientes a varios shards se envían a la vez.
+    Cada cliente tiene su propio Gateway; todos comparten los mismos actores.
+
+    Los metadatos son la fuente de verdad y el índice se deriva de ellos: un
+    cambio está hecho en cuanto lo aceptan los metadatos. El shard de metadatos lo
+    apunta en su outbox hasta que el gateway confirma que llegó al índice. Si el
+    cliente se cae antes, o el índice no responde, el cambio sigue apuntado y
+    repair_index, desde cualquier cliente, lo entrega después.
+
+    Si un TagShard no responde a tiempo, el gateway pide a Ray que lo reinicie.
+    Los TagShard de start_cluster se reinician con el mismo handle y se rellenan
+    desde los metadatos, así que la reparación sirve a todos los clientes.
+
+    El cliente nunca ve errores de Ray. Si un shard muere o no responde, recibe
+    ServiceUnavailable: tras metadata_timeout segundos en los metadatos, y en el
+    índice cuando tampoco responde tras reiniciarlo.
+    """
+
+    def __init__(
+        self,
+        metadata: Sequence[Any],
+        tags: Sequence[Any],
+        content: ContentAPI,
+        *,
+        metadata_timeout: float = 10.0,
+        index_timeout: float = 5.0,
+        restart_timeout: float = 120.0,
+    ) -> None:
+        if not metadata or not tags:
+            raise ValueError("Se necesita al menos un shard de metadatos y etiquetas")
+        are_actors = [isinstance(shard, ActorHandle) for shard in (*metadata, *tags)]
+        if any(are_actors) and not all(are_actors):
+            raise ValueError("Los shards deben ser todos actores de Ray o todos objetos locales")
+        # Con actores se les llama con .remote() y se espera después; con objetos
+        # locales, directamente.
+        self._remote = all(are_actors)
+        self._metadata = list(metadata)
+        self._tags = list(tags)
+        self._content = content
+        self._metadata_timeout = metadata_timeout
+        self._index_timeout = index_timeout
+        self._restart_timeout = restart_timeout
+
+    def put(self, name: str, content: bytes, tags: Iterable[str] = ()) -> FileId:
+        """Crea un archivo y devuelve su ID.
+
+        Guarda primero el contenido, luego los metadatos y al final el índice,
+        para que los metadatos nunca apunten a un contenido que no existe.
+        """
+        normalized = normalize_tags(tags)  # una etiqueta inválida no debe dejar bytes huérfanos
+        file_id = str(uuid.uuid4())
+        stored_hash = self._content.put(content)
+        _verify(content, stored_hash)
+        self._change(file_id, "create", name, normalized, stored_hash)
+        return file_id
+
+    def get(self, file_id: FileId) -> StoredFile:
+        """Devuelve el archivo o lanza FileNotFound si no existe o fue eliminado."""
+        meta = self._resolve(self._call(self._metadata_for(file_id), "get", file_id))
+        content = self._content.get(meta.content_hash)
+        _verify(content, meta.content_hash)
+        return StoredFile(meta.name, content, meta.tags, meta.version)
+
+    def delete(self, file_id: FileId) -> None:
+        """Elimina el archivo y lo saca del índice.
+
+        Los bytes no se borran aquí: otro archivo puede compartir el mismo
+        contenido. Se encargará el recolector de basura.
+        """
+        self._change(file_id, "delete")
+
+    def add_tags(self, file_id: FileId, tags: Iterable[str]) -> int:
+        """Agrega etiquetas y devuelve la nueva versión del archivo."""
+        return self._change(file_id, "add_tags", tuple(tags))
+
+    def remove_tags(self, file_id: FileId, tags: Iterable[str]) -> int:
+        """Quita etiquetas y devuelve la nueva versión del archivo."""
+        return self._change(file_id, "remove_tags", tuple(tags))
+
+    def rename(self, file_id: FileId, new_name: str) -> int:
+        """Cambia el nombre y devuelve la nueva versión del archivo."""
+        return self._change(file_id, "rename", new_name)
+
+    def query(self, expr: str) -> list[FileId]:
+        """Devuelve, ordenados, los archivos vivos que cumplen la consulta.
+
+        El índice solo propone candidatos; la decisión final se toma con las
+        etiquetas actuales de los metadatos, porque el índice puede ir atrasado.
+        """
+        parsed = parse_query(expr)
+        index = self._lookup_many(index_tags(parsed))  # todas las etiquetas a la vez
+        found = candidates(parsed, lambda tag: index[tag])
+        files = self._read_many(found)
+        return sorted(file_id for file_id, meta in files.items() if matches(parsed, meta.tags))
+
+    def list(self) -> list[FileId]:
+        """Devuelve, ordenados, los IDs de todos los archivos vivos."""
+        answers = self._resolve([self._call(shard, "list_ids") for shard in self._metadata])
+        return sorted(file_id for ids in answers for file_id in ids)
+
+    def collect_garbage(self) -> int:
+        """Borra de los almacenes el contenido que ningún archivo vivo usa.
+
+        Devuelve cuántos contenidos distintos se borraron. No debe correr a la
+        vez que un put de ningún cliente: borraría los bytes que ese put ya
+        guardó y cuya ficha aún no existe. El llamador debe detener antes las
+        escrituras de todos los clientes.
+        """
+        live = {meta.content_hash for meta in self._live_files()}
+        return self._content.sweep(live)
+
+    def reconcile(self) -> Reconciliation:
+        """Repara los almacenes después de fallos o particiones.
+
+        Readmite a los almacenes que vuelven a responder, deja cada contenido
+        vivo en las réplicas que indica el anillo y borra lo que nadie usa.
+        Tiene la misma condición que collect_garbage: no debe cruzarse con un put.
+        """
+        live = {meta.content_hash for meta in self._live_files()}
+        return self._content.reconcile(live)
+
+    def repair_index(self) -> int:
+        """Entrega al índice los cambios que quedaron pendientes en los metadatos.
+
+        Un cambio queda pendiente si su cliente se cayó después de que lo
+        aceptaran los metadatos y antes de avisar al índice, o si el índice no
+        respondió. Devuelve cuántos cambios entregó. Se puede llamar en cualquier
+        momento, también con escrituras en curso: entregar dos veces un cambio
+        no tiene efecto.
+        """
+        pending = self._resolve([self._call(shard, "pending") for shard in self._metadata])
+        self._send_to_index({op for changes in pending for ops in changes.values() for op in ops})
+        self._resolve(
+            [
+                self._call(shard, "ack", list(changes))
+                for shard, changes in zip(self._metadata, pending)
+                if changes
+            ]
+        )
+        return sum(len(changes) for changes in pending)
+
+    def verify_index(self) -> IndexCheck:
+        """Compara el índice con el que se obtendría desde los metadatos.
+
+        No cambia nada. Con escrituras en curso puede ver diferencias pasajeras.
+        """
+        index: dict[str, set[FileId]] = {}
+        for entries in self._ask_every_tag_shard("entries"):
+            index.update(entries)
+        return check_index(self._live_files(), index)
+
+    def _lookup_many(self, tags: Iterable[str]) -> dict[str, set[FileId]]:
+        """Devuelve los archivos de cada etiqueta, pidiéndolas todas antes de esperar."""
+        if not self._remote:
+            return {tag: self._tag_shard_for(tag).lookup(tag) for tag in tags}
+        by_shard: dict[int, list[str]] = defaultdict(list)
+        for tag in tags:
+            by_shard[self._tag_index(tag)].append(tag)
+        sent = {
+            index: [self._tags[index].lookup.remote(tag) for tag in group]
+            for index, group in by_shard.items()
+        }
+        found: dict[str, set[FileId]] = {}
+        for index, group in by_shard.items():
+            found.update(zip(group, self._wait_for_index(index, sent[index])))
+        return found
+
+    def _read_many(self, file_ids: Iterable[FileId]) -> dict[FileId, FileMeta]:
+        # Una sola llamada por shard, y todas a la vez, en lugar de una por archivo.
+        by_shard: dict[int, list[FileId]] = defaultdict(list)
+        for file_id in file_ids:
+            by_shard[shard_for(file_id, len(self._metadata))].append(file_id)
+        refs = [self._call(self._metadata[index], "get_many", ids) for index, ids in by_shard.items()]
+        files: dict[FileId, FileMeta] = {}
+        for answer in self._resolve(refs):
+            files.update(answer)
+        return files
+
+    def _change(self, file_id: FileId, method: str, *args: Any) -> int:
+        """Hace un cambio en los metadatos, lo lleva al índice y devuelve la versión."""
+        shard = self._metadata_for(file_id)
+        mutation = self._resolve(self._call(shard, method, file_id, *args))
+        if mutation.index_ops:
+            self._deliver(shard, file_id, mutation)
+        return mutation.version
+
+    def _deliver(self, shard: Any, file_id: FileId, mutation: Mutation) -> None:
+        """Lleva un cambio al índice y lo saca del outbox de su shard de metadatos.
+
+        Si el índice o el ack no responden, no se lanza error: el cambio ya está
+        hecho porque lo aceptaron los metadatos, y sigue en el outbox para
+        repair_index. Entregarlo otra vez no tiene efecto.
+        """
+        try:
+            self._send_to_index(mutation.index_ops)
+            self._resolve(self._call(shard, "ack", [(file_id, mutation.version)]))
+        except ServiceUnavailable:
+            return
+
+    def _send_to_index(self, ops: Iterable[IndexOp]) -> None:
+        if not self._remote:
+            for op in ops:
+                self._tag_shard_for(op.tag).apply(op)
+            return
+        sent: dict[int, list[Any]] = defaultdict(list)
+        for op in ops:
+            index = self._tag_index(op.tag)
+            sent[index].append(self._tags[index].apply.remote(op))
+        for index, refs in sent.items():
+            self._wait_for_index(index, refs)
+
+    def _wait_for_index(self, index: int, refs: list[Any]) -> list[Any]:
+        """Espera las respuestas de un TagShard; si no llegan a tiempo, lo reinicia.
+
+        Un shard muerto y uno colgado se ven igual desde fuera. Con no_restart=False,
+        Ray lo reinicia con el mismo handle, el actor nuevo se rellena desde los
+        metadatos y Ray le repite las peticiones pendientes. Repetirlas es seguro:
+        lookup solo lee y apply ignora un cambio que ya conoce.
+
+        Lanza ServiceUnavailable si el shard está muerto del todo o si tampoco
+        responde después de reiniciarlo.
+        """
+        what = f"El shard de etiquetas {index}"
+        try:
+            return ray.get(refs, timeout=self._index_timeout)
+        except GetTimeoutError:
+            ray.kill(self._tags[index], no_restart=False)
+            return _get(refs, self._restart_timeout, what)
+        except RayActorError as error:  # murió y Ray no lo va a reiniciar
+            raise ServiceUnavailable(f"{what} no responde") from error
+
+    def _ask_every_tag_shard(self, method: str) -> list[Any]:
+        """Hace la misma pregunta a todos los TagShard a la vez."""
+        if not self._remote:
+            return [getattr(shard, method)() for shard in self._tags]
+        sent = [getattr(shard, method).remote() for shard in self._tags]
+        return [self._wait_for_index(index, [ref])[0] for index, ref in enumerate(sent)]
+
+    def _live_files(self) -> list[FileMeta]:
+        answers = self._resolve([self._call(shard, "live_files") for shard in self._metadata])
+        return [meta for files in answers for meta in files]
+
+    def _call(self, target: Any, method: str, *args: Any) -> Any:
+        function = getattr(target, method)
+        return function.remote(*args) if self._remote else function(*args)
+
+    def _resolve(self, result: Any) -> Any:
+        """Espera las respuestas de los shards de metadatos."""
+        if not self._remote:
+            return result
+        return _get(result, self._metadata_timeout, "Un shard de metadatos")
+
+    def _metadata_for(self, file_id: FileId) -> Any:
+        return self._metadata[shard_for(file_id, len(self._metadata))]
+
+    def _tag_shard_for(self, tag: str) -> Any:
+        return self._tags[self._tag_index(tag)]
+
+    def _tag_index(self, tag: str) -> int:
+        return shard_for(tag, len(self._tags))
