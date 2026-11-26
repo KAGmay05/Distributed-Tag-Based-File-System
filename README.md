@@ -413,6 +413,31 @@ Predicción, escrita antes de ejecutar nada:
 | `verify_index()` al terminar | Sin diferencias | Sin diferencias | El índice reconstruido es exactamente el de los metadatos |
 | Consulta a otro shard durante el cuelgue | Menos de 0,1 s | Igual que en el control | El gateway no pasa por el shard colgado |
 
+Se ejecutó con [scripts/experiment_index_hang.py](scripts/experiment_index_hang.py)
+en una sola máquina (Windows 11, Python 3.13, Ray 2.60). Cada ejecución guarda un
+JSON en [experiments/results/](experiments/results/), con la configuración, cada
+intento de consulta y el PID antes y después.
+
+| Medida | Predicho con fallo | Observado: control (3) | Observado: con fallo (3) | ¿Acertó? |
+| --- | --- | --- | --- | --- |
+| Tiempo hasta la primera consulta correcta | 7 a 10 s | 0,005 a 0,006 s | 8,91, 8,96 y 9,02 s | Sí, en la parte alta del rango: el reinicio costó unos 4 s además de los 5 s de timeout |
+| Archivos perdidos | 0 de 20 | 0 de 20 | 0 de 20 | Sí |
+| PID del shard | Cambia | No cambia | Cambia en las 3 | Sí |
+| `verify_index()` al terminar | Sin diferencias | 0 faltan, 0 sobran | 0 faltan, 0 sobran | Sí |
+| Consulta a otro shard durante el cuelgue | Igual que el control | 0,006 a 0,007 s | 0,005 a 0,007 s | Sí |
+
+En qué se quedó corta la predicción:
+
+- No decía qué ve el cliente. No recibe ningún error ni tiene que reintentar: la
+  primera consulta tarda unos 9 s y ya devuelve los 20 archivos. Todo el
+  reinicio ocurre dentro de esa llamada.
+- No preveía la única huella del reintento: el raylet escribe en el log que
+  `lookup` falló porque el actor se reinició y que lo repetirá. El gateway no se
+  entera de que su petición se ejecutó dos veces.
+- No separaba las partes del tiempo. Los 5 s del timeout son fijos; los otros
+  4 s, que incluyen arrancar el proceso y rellenar el índice, no se midieron por
+  separado. Con muchos más archivos, rellenar el índice tardaría más.
+
 ## Retirada de Ray
 
 Cada fila completa la frase "Ray me permite expresar ___; debajo necesita ___; mi
