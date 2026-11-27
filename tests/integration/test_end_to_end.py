@@ -7,9 +7,11 @@ y muchas consultas) con el modelo, no solo lo que acaba de cambiar.
 
 import os
 import random
+import time
 
 import pytest
 import ray
+from actor_restarts import crash_and_wait_for_restart
 from ray.exceptions import RayActorError
 
 from tagfs.content import ContentNotFound, StorageUnavailable, content_hash
@@ -60,9 +62,24 @@ class Model:
         self.files.pop(file_id, None)
         self.deleted.add(file_id)
 
+    def add_tags_by_query(self, expr, tags):
+        return {file_id: self.add_tags(file_id, tags) for file_id in self.query(expr)}
+
+    def remove_tags_by_query(self, expr, tags):
+        return {file_id: self.remove_tags(file_id, tags) for file_id in self.query(expr)}
+
+    def delete_by_query(self, expr):
+        done = {file_id: self.files[file_id].version + 1 for file_id in self.query(expr)}
+        for file_id in done:
+            self.delete(file_id)
+        return done
+
     def query(self, expr):
         parsed = parse_query(expr)
         return sorted(file_id for file_id, f in self.files.items() if matches(parsed, f.tags))
+
+    def list(self):
+        return [(file_id, f.name, f.tags, f.version) for file_id, f in sorted(self.files.items())]
 
     def live_contents(self):
         return {f.content for f in self.files.values()}
@@ -102,10 +119,22 @@ class Client:
         assert self.gateway.delete(file_id) is None
         self.model.delete(file_id)
 
+    def add_tags_by_query(self, expr, tags):
+        expected = self.model.add_tags_by_query(expr, tags)
+        assert self.gateway.add_tags_by_query(expr, tags) == (expected, []), expr
+
+    def remove_tags_by_query(self, expr, tags):
+        expected = self.model.remove_tags_by_query(expr, tags)
+        assert self.gateway.remove_tags_by_query(expr, tags) == (expected, []), expr
+
+    def delete_by_query(self, expr):
+        expected = self.model.delete_by_query(expr)
+        assert self.gateway.delete_by_query(expr) == (expected, []), expr
+
 
 def assert_matches_model(gateway, model, queries=QUERIES):
     """Compara todo lo visible del sistema con el modelo."""
-    assert gateway.list() == sorted(model.files)
+    assert gateway.list() == model.list()
     for file_id, expected in model.files.items():
         assert gateway.get(file_id) == expected, file_id
     for file_id in model.deleted:
@@ -152,7 +181,7 @@ def test_full_life_of_the_system_survives_failures():
     copia = gateway.put("copia.jpg", b"bytes de la playa", {"foto", "backup"})
     informe = gateway.put("informe.pdf", b"bytes del informe", {"trabajo", "2024", "borrador"})
 
-    assert gateway.list() == sorted([playa, copia, informe])
+    assert [file.file_id for file in gateway.list()] == sorted([playa, copia, informe])
     assert gateway.get(playa) == ("playa.jpg", b"bytes de la playa", {"foto", "viaje", "2024"}, 1)
     assert gateway.query("foto") == sorted([playa, copia])
     assert gateway.query("2024 AND NOT borrador") == [playa]
@@ -174,8 +203,8 @@ def test_full_life_of_the_system_survives_failures():
     nuevo = gateway.put("nuevo.txt", b"bytes nuevos", {"texto"})
     assert gateway.get(nuevo).content == b"bytes nuevos"
 
-    # 4. Muere la sección del índice que guarda "foto": Ray la reinicia.
-    ray.kill(gateway._tag_shard_for("foto"), no_restart=False)
+    # 4. Muere la sección del índice que guarda "foto": Ray la reinicia y la rellena.
+    crash_and_wait_for_restart(gateway._tag_shard_for("foto"))
 
     assert gateway.query("foto") == sorted([playa, copia])
     gateway.add_tags(nuevo, {"foto"})
@@ -195,7 +224,12 @@ def test_full_life_of_the_system_survives_failures():
 
     with pytest.raises(ContentNotFound):
         gateway._content.get(shared_hash)
-    assert gateway.list() == sorted([informe, nuevo])
+    assert gateway.list() == sorted(
+        [
+            (informe, "informe.pdf", {"trabajo", "2024", "final"}, 3),
+            (nuevo, "nuevo.txt", {"texto", "foto"}, 2),
+        ]
+    )
     assert gateway.get(informe).tags == {"trabajo", "2024", "final"}
 
 
@@ -326,7 +360,7 @@ def test_storage_nodes_fail_one_after_another():
     ray.kill(cluster.storage[second])
     with pytest.raises(ContentNotFound):
         gateway.get(victim)
-    assert victim in gateway.list()
+    assert victim in [file.file_id for file in gateway.list()]
     assert victim in gateway.query("foto")
     client.rename(victim, "victima-renombrada.txt")
     readable = 0
@@ -348,7 +382,7 @@ def test_storage_nodes_fail_one_after_another():
         gateway.put("imposible.txt", b"no hay donde guardarlo", {"foto"})
     with pytest.raises(ContentNotFound):
         gateway.get(after_first)
-    assert gateway.list() == sorted(model.files)
+    assert gateway.list() == model.list()
     client.add_tags(after_first, {"musica"})
     for expr in QUERIES:
         assert gateway.query(expr) == model.query(expr), expr
@@ -451,8 +485,11 @@ def test_random_operations_with_random_failures(seed):
     for step in range(80):
         live = sorted(model.files)
         action = rng.choices(
-            ["put", "add", "remove", "rename", "delete", "missing", "gc", "kill_tags", "kill_storage"],
-            weights=[5, 3, 3, 1, 2, 1, 1, 1, 1],
+            [
+                "put", "add", "remove", "rename", "delete", "missing", "gc", "kill_tags",
+                "kill_storage", "add_by_query", "remove_by_query", "delete_by_query",
+            ],
+            weights=[5, 3, 3, 1, 2, 1, 1, 1, 1, 2, 2, 1],
         )[0]
         if action == "put" or not live:
             client.put(f"{step}.dat", rng.choice(CONTENTS), random_tags(rng))
@@ -464,6 +501,12 @@ def test_random_operations_with_random_failures(seed):
             client.rename(rng.choice(live), f"renombrado-{step}.dat")
         elif action == "delete":
             client.delete(rng.choice(live))
+        elif action == "add_by_query":
+            client.add_tags_by_query(rng.choice(QUERIES), random_tags(rng))
+        elif action == "remove_by_query":
+            client.remove_tags_by_query(rng.choice(QUERIES), random_tags(rng))
+        elif action == "delete_by_query":
+            client.delete_by_query(rng.choice(QUERIES))
         elif action == "missing":
             target = rng.choice(sorted(model.deleted) or ["no-existe"])
             with pytest.raises(FileNotFound):
@@ -480,3 +523,27 @@ def test_random_operations_with_random_failures(seed):
 
     gateway.collect_garbage()
     assert_matches_model(gateway, model)
+
+
+def test_a_change_by_query_reports_the_files_of_a_dead_metadata_shard_as_unknown():
+    cluster = start_cluster()
+    gateway = cluster.gateway()
+    victim = gateway._metadata[0]
+    ids = []
+    while sum(gateway._metadata_for(f) is victim for f in ids) < 2 or len(ids) < 10:
+        ids.append(gateway.put(f"{len(ids)}.txt", b"x", {"doc"}))
+    lost = sorted(f for f in ids if gateway._metadata_for(f) is victim)
+    kept = sorted(f for f in ids if gateway._metadata_for(f) is not victim)
+
+    ray.kill(victim)
+    deadline = time.monotonic() + 30
+    with pytest.raises(RayActorError):  # ray.kill no espera: se comprueba que ya murió
+        while time.monotonic() < deadline:
+            ray.get(victim.pid.remote())
+
+    # Los shards vivos hacen su parte; de los archivos del muerto no se sabe nada.
+    result = gateway.add_tags_by_query("doc", {"masiva"})
+    assert result == ({f: 2 for f in kept}, lost)
+    assert gateway.query("masiva") == kept
+    # unknown solo trae candidatos del índice: con "masiva" no hay ninguno del shard muerto.
+    assert gateway.delete_by_query("masiva") == ({f: 3 for f in kept}, [])

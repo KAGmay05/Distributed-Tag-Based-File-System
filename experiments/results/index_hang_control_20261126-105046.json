@@ -1,0 +1,45 @@
+{
+  "experiment": "index_hang",
+  "mode": "control",
+  "finished_at": "2026-11-26T15:50:45+00:00",
+  "ray_version": "2.60.0",
+  "python_version": "3.13.7",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "config": {
+    "metadata_shards": 4,
+    "tag_shards": 4,
+    "storage_nodes": 4,
+    "replication_factor": 2,
+    "metadata_timeout": 10.0,
+    "index_timeout": 5.0,
+    "restart_timeout": 120.0,
+    "worker_start_timeout": 120,
+    "files": 20
+  },
+  "tag": "exp-hang",
+  "tag_shard": 0,
+  "recovered": true,
+  "seconds_to_first_correct_query": 0.006,
+  "attempts": [
+    {
+      "seconds": 0.006,
+      "found": 20
+    }
+  ],
+  "pid_before": 3200,
+  "pid_after": 3200,
+  "pid_changed": false,
+  "expected_files": 20,
+  "found_files": 20,
+  "lost_files": 0,
+  "verify_index": {
+    "missing": 0,
+    "extra": 0
+  },
+  "other_shard_query": {
+    "tag": "exp-otro-0",
+    "tag_shard": 3,
+    "seconds": 0.006,
+    "correct": true
+  }
+}

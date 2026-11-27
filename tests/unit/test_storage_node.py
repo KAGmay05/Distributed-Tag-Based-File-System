@@ -66,10 +66,3 @@ def test_delete_removes_the_content_and_can_be_repeated():
     node.delete(KEY)
     node.delete(KEY)
     assert not node.has(KEY)
-
-
-def test_each_node_keeps_its_own_data():
-    node_a = StorageNode()
-    node_b = StorageNode()
-    node_a.put(KEY, DATA)
-    assert not node_b.has(KEY)

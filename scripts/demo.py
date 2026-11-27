@@ -185,7 +185,7 @@ def demo_client_crash(gateway: Gateway, cluster: RayCluster) -> None:
         run_in_workers(client_that_dies_halfway, [(cluster,)])
     except ray.exceptions.WorkerCrashedError:
         print("    (si Ray avisa de que un worker murió, es esta caída simulada)")
-    saved = any(gateway.get(file_id).name == "a-medias.txt" for file_id in gateway.list())
+    saved = any(file.name == "a-medias.txt" for file in gateway.list())
     show("¿Los metadatos tienen el archivo?", saved)
     show("Archivos con 'a-medias' según query", len(gateway.query("a-medias")))
     show("Entradas que faltan en el índice", len(gateway.verify_index().missing))

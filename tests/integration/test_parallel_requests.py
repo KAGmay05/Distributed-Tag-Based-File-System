@@ -17,6 +17,7 @@ import ray
 
 from tagfs.fake_content_store import FakeContentStore
 from tagfs.gateway import Gateway
+from tagfs.model import IndexOp
 from tagfs.ray_runtime import ActorProxy, start_cluster
 from tagfs.router import shard_for
 from tagfs.tag_shard import TagShard
@@ -49,7 +50,7 @@ def waiting_shards(count):
         def ready(self):
             return True
 
-        def list_ids(self):
+        def live_files(self):
             self._wait_for_the_rest()
             return []
 
@@ -57,8 +58,12 @@ def waiting_shards(count):
             self._wait_for_the_rest()
             return set()
 
-        def apply(self, op):
+        def apply_many(self, ops):
             self._wait_for_the_rest()
+
+        def delete_matching(self, file_ids, expr):
+            self._wait_for_the_rest()
+            return {}
 
         def _wait_for_the_rest(self):
             ray.get(self._meeting.arrive.remote())
@@ -77,15 +82,19 @@ def waiting_shards(count):
     return tuple(ActorProxy(shard) for shard in shards)
 
 
-def one_tag_per_shard(shards):
-    """Devuelve una etiqueta para cada shard, en orden."""
+def one_key_per_shard(prefix, shards):
+    """Devuelve una clave para cada shard, en orden."""
     found = {}
     number = 0
     while len(found) < shards:
-        tag = f"etiqueta-{number}"
-        found.setdefault(shard_for(tag, shards), tag)
+        key = f"{prefix}-{number}"
+        found.setdefault(shard_for(key, shards), key)
         number += 1
     return [found[index] for index in range(shards)]
+
+
+def one_tag_per_shard(shards):
+    return one_key_per_shard("etiqueta", shards)
 
 
 @pytest.fixture
@@ -112,6 +121,15 @@ def test_put_sends_its_index_changes_at_once(cluster):
     file_id = gateway.put("a.txt", b"x", tags)
 
     assert gateway.get(file_id).tags == frozenset(tags)
+
+
+def test_a_change_by_query_asks_every_metadata_shard_at_once(cluster):
+    # El índice real da un candidato a cada shard de metadatos de prueba.
+    file_ids = one_key_per_shard("archivo", SHARDS)
+    cluster.tags[0].apply_many([IndexOp("doc", file_id, True, 1) for file_id in file_ids])
+    gateway = replace(cluster, metadata=waiting_shards(SHARDS)).gateway()
+
+    assert gateway.delete_by_query("doc") == ({}, [])
 
 
 def test_shards_must_be_all_actors_or_all_local_objects(cluster):
