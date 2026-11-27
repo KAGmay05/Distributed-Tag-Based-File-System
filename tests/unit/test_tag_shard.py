@@ -1,3 +1,5 @@
+from itertools import permutations
+
 from tagfs.model import FileMeta, IndexOp
 from tagfs.tag_shard import TagShard, check_index
 
@@ -38,6 +40,61 @@ def test_versions_are_independent_per_tag_and_file():
 
     assert shard.lookup("foto") == {"f1", "f2"}
     assert shard.lookup("viaje") == {"f1"}
+
+
+BATCH = [
+    IndexOp("foto", "f1", True, 1),
+    IndexOp("viaje", "f1", True, 1),
+    IndexOp("foto", "f2", True, 4),
+    IndexOp("foto", "f2", False, 3),  # antiguo: llega después de la versión 4
+    IndexOp("viaje", "f1", False, 2),
+    IndexOp("foto", "f1", True, 1),  # repetido
+]
+
+
+def test_apply_many_gives_the_same_index_as_applying_one_by_one():
+    one_by_one, batched = TagShard(), TagShard()
+
+    for op in BATCH:
+        one_by_one.apply(op)
+    batched.apply_many(BATCH)
+
+    assert batched.entries() == one_by_one.entries() == {"foto": {"f1", "f2"}}
+
+
+def test_apply_many_gives_the_same_index_in_any_order():
+    for ops in permutations(BATCH):
+        shard = TagShard()
+        shard.apply_many(ops)
+
+        assert shard.entries() == {"foto": {"f1", "f2"}}
+
+
+def test_repeating_a_batch_whole_or_in_part_changes_nothing():
+    shard = TagShard()
+    shard.apply_many(BATCH)
+
+    shard.apply_many(BATCH)
+    shard.apply_many(BATCH[:3])
+
+    assert shard.entries() == {"foto": {"f1", "f2"}}
+
+
+def test_a_late_batch_cannot_undo_newer_changes():
+    shard = TagShard()
+    shard.apply(IndexOp("foto", "f1", False, 9))
+
+    shard.apply_many(BATCH)
+
+    assert shard.entries() == {"foto": {"f2"}}
+
+
+def test_an_empty_batch_is_valid():
+    shard = TagShard()
+
+    shard.apply_many([])
+
+    assert shard.entries() == {}
 
 
 def test_entries_leave_out_removed_files_and_empty_tags():

@@ -9,6 +9,10 @@ import pytest
 from tagfs.model import FileNotFound, InvalidQuery, InvalidTag
 
 
+def ids(files):
+    return [file.file_id for file in files]
+
+
 class GatewayContract:
     def test_put_and_get_round_trip(self, gateway):
         file_id = gateway.put("playa.jpg", b"contenido", {"Foto", "viaje"})
@@ -20,7 +24,7 @@ class GatewayContract:
         second = gateway.put("a.txt", b"igual", {"doc"})
 
         assert first != second
-        assert gateway.list() == sorted([first, second])
+        assert ids(gateway.list()) == sorted([first, second])
 
     def test_every_operation_on_an_unknown_file_fails(self, gateway):
         for operation in [
@@ -49,15 +53,43 @@ class GatewayContract:
         with pytest.raises(InvalidTag):
             gateway.add_tags(file_id, {"valida", "dos palabras"})
 
-        assert gateway.list() == [file_id]
+        assert ids(gateway.list()) == [file_id]
         assert gateway.get(file_id) == ("a.txt", b"x", {"doc"}, 1)
         assert gateway.query("valida") == []
         assert gateway.collect_garbage() == 0  # el put rechazado no dejó bytes
+
+    def test_a_string_is_not_a_collection_of_tags(self, gateway):
+        # Sin esta regla, "foto" se guardaría como las etiquetas f, o y t.
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+
+        with pytest.raises(InvalidTag):
+            gateway.put("b.txt", b"no debe guardarse", "foto")
+        with pytest.raises(InvalidTag):
+            gateway.add_tags(file_id, "foto")
+        with pytest.raises(InvalidTag):
+            gateway.remove_tags(file_id, "doc")
+
+        assert gateway.list() == [(file_id, "a.txt", {"doc"}, 1)]
+        assert gateway.collect_garbage() == 0
+
+    def test_a_name_must_be_text(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+
+        for name in [None, 7, b"a.txt"]:
+            with pytest.raises(TypeError):
+                gateway.put(name, b"no debe guardarse", {"doc"})
+            with pytest.raises(TypeError):
+                gateway.rename(file_id, name)
+
+        assert gateway.list() == [(file_id, "a.txt", {"doc"}, 1)]
+        assert gateway.collect_garbage() == 0
 
     def test_invalid_query_is_rejected(self, gateway):
         for expr in ["", "doc AND", "(doc", "NOT doc", "doc OR NOT borrador"]:
             with pytest.raises(InvalidQuery):
                 gateway.query(expr)
+            with pytest.raises(InvalidQuery):
+                gateway.list(expr)
 
     def test_deleted_file_can_be_deleted_again_but_not_changed(self, gateway):
         file_id = gateway.put("a.txt", b"x", {"doc"})
@@ -133,13 +165,37 @@ class GatewayContract:
         }
         for expr, expected in cases.items():
             assert gateway.query(expr) == sorted(expected), expr
+            assert ids(gateway.list(expr)) == sorted(expected), expr
 
     def test_list_returns_every_live_file_in_order(self, gateway):
         created = [gateway.put(f"{i}.txt", b"x", {"doc"}) for i in range(10)]
 
         gateway.delete(created[0])
 
-        assert gateway.list() == sorted(created[1:])
+        assert ids(gateway.list()) == sorted(created[1:])
+
+    def test_list_describes_each_file(self, gateway):
+        foto = gateway.put("foto.jpg", b"1", {"Foto", "2024"})
+        video = gateway.put("video.mp4", b"2", {"video"})
+        gateway.rename(foto, "playa.jpg")
+        gateway.add_tags(video, {"2024"})
+
+        files = [(foto, "playa.jpg", {"foto", "2024"}, 2), (video, "video.mp4", {"video", "2024"}, 2)]
+        assert gateway.list() == sorted(files)
+        assert gateway.list("2024") == sorted(files)
+        assert gateway.list("foto AND 2024") == [files[0]]
+
+    def test_list_with_a_query_follows_every_change(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+
+        gateway.add_tags(file_id, {"urgente"})
+        assert gateway.list("urgente") == [(file_id, "a.txt", {"doc", "urgente"}, 2)]
+
+        gateway.remove_tags(file_id, {"urgente"})
+        assert gateway.list("urgente") == []
+
+        gateway.delete(file_id)
+        assert gateway.list("doc") == []
 
     def test_collect_garbage_removes_only_content_no_live_file_uses(self, gateway):
         first = gateway.put("a.txt", b"igual", {"doc"})

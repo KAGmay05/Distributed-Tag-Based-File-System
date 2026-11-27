@@ -57,12 +57,33 @@ class Mutation(NamedTuple):
     index_ops: tuple[IndexOp, ...]
 
 
+class FileInfo(NamedTuple):
+    """Datos de un archivo sin su contenido, tal como los recibe el cliente."""
+
+    file_id: FileId
+    name: str
+    tags: frozenset[str]
+    version: int
+
+
+class BulkResult(NamedTuple):
+    """Resultado de un cambio sobre todos los archivos que cumplen una consulta."""
+
+    # Los que cumplían la consulta, con su versión resultante. Incluye los que ya
+    # estaban como se pedía, igual que add_tags devuelve la versión sin cambiarla.
+    done: dict[FileId, int]
+    # Posibles archivos cuyo shard no respondió: no se sabe si se cambiaron.
+    unknown: list[FileId]
+
+
 def normalize_tag(tag: str) -> str:
     """Devuelve la etiqueta en minúsculas o lanza InvalidTag.
 
     Las reglas garantizan que toda etiqueta guardada se pueda escribir en una
     consulta: sin espacios ni paréntesis, y sin usar palabras reservadas.
     """
+    if not isinstance(tag, str):
+        raise InvalidTag(f"Una etiqueta debe ser texto: {tag!r}")
     normalized = tag.lower()
     if (
         not normalized
@@ -74,4 +95,8 @@ def normalize_tag(tag: str) -> str:
 
 
 def normalize_tags(tags: Iterable[str]) -> frozenset[str]:
+    """Normaliza un conjunto de etiquetas o lanza InvalidTag."""
+    # Un texto también se puede recorrer: "foto" se guardaría como f, o y t.
+    if isinstance(tags, str):
+        raise InvalidTag(f"Se espera un conjunto de etiquetas, no un texto: {tags!r}")
     return frozenset(normalize_tag(tag) for tag in tags)

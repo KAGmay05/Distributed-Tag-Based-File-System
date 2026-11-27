@@ -45,6 +45,16 @@ class TagShard:
         if current is None or op.version > current.version:
             entries[op.file_id] = _Entry(op.version, op.present)
 
+    def apply_many(self, ops: Iterable[IndexOp]) -> None:
+        """Aplica varios cambios en una sola llamada.
+
+        Con una llamada por cambio, una operación sobre miles de archivos tardaría
+        más que el timeout del índice, y el gateway reiniciaría un shard sano. El
+        orden no importa y repetir el lote, entero o a medias, no tiene efecto.
+        """
+        for op in ops:
+            self.apply(op)
+
     def lookup(self, tag: str) -> set[FileId]:
         """Devuelve los archivos de una etiqueta ya normalizada."""
         entries = self._index.get(tag, {})

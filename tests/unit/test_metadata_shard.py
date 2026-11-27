@@ -2,6 +2,7 @@ import pytest
 
 from tagfs.metadata_shard import MetadataShard
 from tagfs.model import FileIdConflict, FileNotFound, IndexOp, InvalidTag
+from tagfs.query import parse_query
 
 
 @pytest.fixture
@@ -176,3 +177,142 @@ def test_pending_changes_of_a_deleted_file_take_it_out_of_the_index(shard):
         IndexOp("foto", "f1", False, 2),
         IndexOp("viaje", "f1", False, 2),
     )
+
+
+# Cambios por consulta: el shard recibe candidatos y cambia solo los que cumplen.
+
+CANDIDATES = ["f1", "f2", "f3"]
+PHOTOS_2024 = parse_query("foto AND 2024")
+
+every_bulk_change = pytest.mark.parametrize("method", ["delete", "add_tags", "remove_tags"])
+
+
+@pytest.fixture
+def photos():
+    shard = MetadataShard()
+    shard.create("f1", "playa.jpg", {"foto", "2024"}, "hash-1")
+    shard.create("f2", "monte.jpg", {"foto", "2024"}, "hash-2")
+    shard.create("f3", "vieja.jpg", {"foto", "2023"}, "hash-3")
+    shard.ack(list(shard.pending()))
+    return shard
+
+
+def change_matching(shard, method, file_ids=CANDIDATES):
+    tags = {"delete": (), "add_tags": ({"nueva"},), "remove_tags": ({"foto"},)}[method]
+    return getattr(shard, f"{method}_matching")(file_ids, PHOTOS_2024, *tags)
+
+
+def test_delete_matching_deletes_only_the_files_that_match(photos):
+    result = photos.delete_matching(CANDIDATES, PHOTOS_2024)
+
+    assert result == {
+        "f1": (2, (IndexOp("2024", "f1", False, 2), IndexOp("foto", "f1", False, 2))),
+        "f2": (2, (IndexOp("2024", "f2", False, 2), IndexOp("foto", "f2", False, 2))),
+    }
+    assert photos.list_ids() == ["f3"]
+
+
+def test_add_tags_matching_changes_only_the_files_that_match(photos):
+    result = photos.add_tags_matching(CANDIDATES, PHOTOS_2024, {"Verano"})
+
+    assert result == {
+        "f1": (2, (IndexOp("verano", "f1", True, 2),)),
+        "f2": (2, (IndexOp("verano", "f2", True, 2),)),
+    }
+    assert photos.get("f1").tags == {"foto", "2024", "verano"}
+    assert photos.get("f3").tags == {"foto", "2023"}
+
+
+def test_remove_tags_matching_changes_only_the_files_that_match(photos):
+    result = photos.remove_tags_matching(CANDIDATES, PHOTOS_2024, {"FOTO", "inexistente"})
+
+    assert result == {
+        "f1": (2, (IndexOp("foto", "f1", False, 2),)),
+        "f2": (2, (IndexOp("foto", "f2", False, 2),)),
+    }
+    assert photos.get("f1").tags == {"2024"}
+    assert photos.get("f3").tags == {"foto", "2023"}
+
+
+@every_bulk_change
+def test_a_file_that_stopped_matching_is_left_alone(photos, method):
+    # Alguien consultó y obtuvo f1, pero f1 deja de cumplir antes de que pida el cambio.
+    photos.remove_tags("f1", {"2024"})
+
+    assert list(change_matching(photos, method)) == ["f2"]
+    assert photos.get("f1").tags == {"foto"}
+    assert photos.get("f1").version == 2
+
+
+@every_bulk_change
+def test_a_rename_does_not_stop_a_file_from_matching(photos, method):
+    photos.rename("f1", "otra.jpg")
+
+    assert list(change_matching(photos, method)) == ["f1", "f2"]
+
+
+@every_bulk_change
+def test_deleted_and_unknown_candidates_are_skipped(photos, method):
+    photos.delete("f1")
+
+    assert list(change_matching(photos, method, ["f1", "desconocido", "f2"])) == ["f2"]
+    assert photos.list_ids() == (["f3"] if method == "delete" else ["f2", "f3"])
+
+
+@every_bulk_change
+def test_only_the_candidates_are_changed(photos, method):
+    assert list(change_matching(photos, method, ["f2"])) == ["f2"]
+    assert photos.get("f1").version == 1
+
+
+@every_bulk_change
+def test_no_candidates_changes_nothing(photos, method):
+    assert change_matching(photos, method, []) == {}
+    assert [meta.version for meta in photos.live_files()] == [1, 1, 1]
+
+
+def test_a_negative_part_is_checked_with_the_current_tags(photos):
+    photos.add_tags("f1", {"favorita"})
+
+    result = photos.delete_matching(CANDIDATES, parse_query("2024 AND NOT favorita"))
+
+    assert list(result) == ["f2"]
+
+
+@pytest.mark.parametrize("method", ["add_tags_matching", "remove_tags_matching"])
+@pytest.mark.parametrize("tags", [{"foto", "and"}, "foto"])
+@pytest.mark.parametrize("file_ids", [CANDIDATES, []], ids=["candidates", "none"])
+def test_an_invalid_tag_changes_no_matching_file(photos, method, tags, file_ids):
+    with pytest.raises(InvalidTag):
+        getattr(photos, method)(file_ids, PHOTOS_2024, tags)
+
+    assert [meta.version for meta in photos.live_files()] == [1, 1, 1]
+    assert photos.pending() == {}
+
+
+def test_matching_files_that_already_have_the_tag_keep_their_version(photos):
+    photos.add_tags("f1", {"verano"})
+
+    result = photos.add_tags_matching(CANDIDATES, PHOTOS_2024, {"verano"})
+
+    assert result == {"f1": (2, ()), "f2": (2, (IndexOp("verano", "f2", True, 2),))}
+
+
+@every_bulk_change
+def test_repeating_a_bulk_change_does_nothing_more(photos, method):
+    change_matching(photos, method)
+    before = photos.live_files()
+
+    repeated = change_matching(photos, method)
+
+    assert photos.live_files() == before
+    assert all(ops == () for _, ops in repeated.values())
+
+
+@every_bulk_change
+def test_bulk_changes_wait_in_the_outbox_like_any_other(photos, method):
+    result = change_matching(photos, method)
+
+    assert photos.pending() == {
+        (file_id, version): ops for file_id, (version, ops) in result.items()
+    }

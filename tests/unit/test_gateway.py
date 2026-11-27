@@ -26,10 +26,15 @@ class RecordingStore(FakeContentStore):
     def __init__(self):
         super().__init__()
         self.put_calls = 0
+        self.get_calls = 0
 
     def put(self, content):
         self.put_calls += 1
         return super().put(content)
+
+    def get(self, content_hash):
+        self.get_calls += 1
+        return super().get(content_hash)
 
 
 class WrongHashStore(FakeContentStore):
@@ -53,14 +58,35 @@ class CountingShard(MetadataShard):
         return super().get_many(file_ids)
 
 
-def test_invalid_tag_fails_before_storing_content():
+@pytest.mark.parametrize("tags", [{"valida", "or"}, {"valida", 2024}, "foto"])
+def test_invalid_tags_fail_before_storing_content(tags):
     store = RecordingStore()
     gateway, _, _ = build_gateway(store)
 
     with pytest.raises(InvalidTag):
-        gateway.put("a.txt", b"x", {"valida", "or"})
+        gateway.put("a.txt", b"x", tags)
 
     assert store.put_calls == 0
+
+
+def test_invalid_name_fails_before_storing_content():
+    store = RecordingStore()
+    gateway, _, _ = build_gateway(store)
+
+    with pytest.raises(TypeError):
+        gateway.put(None, b"x", {"doc"})
+
+    assert store.put_calls == 0
+
+
+def test_list_does_not_read_any_content():
+    store = RecordingStore()
+    gateway, _, _ = build_gateway(store)
+    gateway.put("a.txt", b"x", {"doc"})
+
+    assert len(gateway.list()) == len(gateway.list("doc")) == 1
+
+    assert store.get_calls == 0
 
 
 def test_wrong_hash_from_store_stops_put_before_metadata():
@@ -119,8 +145,10 @@ def test_query_reads_each_metadata_shard_once():
     created = [gateway.put(f"{i}.txt", b"x", {"doc"}) for i in range(30)]
 
     assert gateway.query("doc") == sorted(created)
-
     assert [shard.get_many_calls for shard in metadata] == [1, 1, 1]
+
+    assert len(gateway.list("doc")) == 30  # describirlos no cuesta llamadas de más
+    assert [shard.get_many_calls for shard in metadata] == [2, 2, 2]
 
 
 def test_query_filters_stale_index_entries_with_metadata():
@@ -165,7 +193,7 @@ def test_a_file_left_out_of_the_index_is_found_after_repair():
     with pytest.raises(ClientStopped):
         crashing.put("a.txt", b"x", {"doc"})
 
-    [file_id] = gateway.list()  # los metadatos lo tienen
+    [(file_id, *_)] = gateway.list()  # los metadatos lo tienen
     assert gateway.query("doc") == []  # pero el índice no
     assert gateway.verify_index() == ([("doc", file_id)], [])
 

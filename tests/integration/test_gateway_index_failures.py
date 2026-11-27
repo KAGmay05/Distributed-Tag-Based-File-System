@@ -225,7 +225,7 @@ def test_a_client_that_dies_before_telling_the_index_is_repaired(cluster):
         run_in_workers(client_that_dies_halfway, [(cluster,)])
 
     gateway = cluster.gateway()
-    [file_id] = [f for f in gateway.list() if gateway.get(f).name == "a-medias.txt"]
+    [file_id] = [f.file_id for f in gateway.list() if f.name == "a-medias.txt"]
     assert gateway.query("i10-doc") == []
     assert ("i10-doc", file_id) in gateway.verify_index().missing
 

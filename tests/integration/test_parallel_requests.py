@@ -49,7 +49,7 @@ def waiting_shards(count):
         def ready(self):
             return True
 
-        def list_ids(self):
+        def live_files(self):
             self._wait_for_the_rest()
             return []
 

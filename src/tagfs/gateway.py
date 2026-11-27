@@ -12,7 +12,7 @@ from ray.exceptions import GetTimeoutError, RayActorError
 
 from tagfs.content import ContentCorrupted, content_hash
 from tagfs.content_store import Reconciliation
-from tagfs.model import FileId, FileMeta, IndexOp, Mutation, normalize_tags
+from tagfs.model import FileId, FileInfo, FileMeta, IndexOp, Mutation, normalize_tags
 from tagfs.query import candidates, index_tags, matches, parse_query
 from tagfs.router import shard_for
 from tagfs.tag_shard import IndexCheck, check_index
@@ -36,6 +36,11 @@ class ContentAPI(Protocol):
 def _verify(content: bytes, expected_hash: str) -> None:
     if content_hash(content) != expected_hash:
         raise ContentCorrupted(expected_hash)
+
+
+def _check_name(name: str) -> None:
+    if not isinstance(name, str):
+        raise TypeError(f"El nombre debe ser texto, no {type(name).__name__}")
 
 
 class StoredFile(NamedTuple):
@@ -96,7 +101,9 @@ class Gateway:
         Guarda primero el contenido, luego los metadatos y al final el índice,
         para que los metadatos nunca apunten a un contenido que no existe.
         """
-        normalized = normalize_tags(tags)  # una etiqueta inválida no debe dejar bytes huérfanos
+        # Se valida todo antes de guardar: un error aquí no debe dejar bytes huérfanos.
+        _check_name(name)
+        normalized = normalize_tags(tags)
         file_id = str(uuid.uuid4())
         stored_hash = self._content.put(content)
         _verify(content, stored_hash)
@@ -120,32 +127,30 @@ class Gateway:
 
     def add_tags(self, file_id: FileId, tags: Iterable[str]) -> int:
         """Agrega etiquetas y devuelve la nueva versión del archivo."""
-        return self._change(file_id, "add_tags", tuple(tags))
+        return self._change(file_id, "add_tags", normalize_tags(tags))
 
     def remove_tags(self, file_id: FileId, tags: Iterable[str]) -> int:
         """Quita etiquetas y devuelve la nueva versión del archivo."""
-        return self._change(file_id, "remove_tags", tuple(tags))
+        return self._change(file_id, "remove_tags", normalize_tags(tags))
 
     def rename(self, file_id: FileId, new_name: str) -> int:
         """Cambia el nombre y devuelve la nueva versión del archivo."""
+        _check_name(new_name)
         return self._change(file_id, "rename", new_name)
 
     def query(self, expr: str) -> list[FileId]:
-        """Devuelve, ordenados, los archivos vivos que cumplen la consulta.
+        """Devuelve, ordenados, los IDs de los archivos vivos que cumplen la consulta."""
+        return sorted(self._find(expr))
 
-        El índice solo propone candidatos; la decisión final se toma con las
-        etiquetas actuales de los metadatos, porque el índice puede ir atrasado.
+    def list(self, expr: str | None = None) -> list[FileInfo]:
+        """Describe, ordenados por ID, los archivos vivos que cumplen la consulta.
+
+        Sin consulta, los describe todos. Devuelve el nombre, las etiquetas y la
+        versión de cada uno sin descargar su contenido.
         """
-        parsed = parse_query(expr)
-        index = self._lookup_many(index_tags(parsed))  # todas las etiquetas a la vez
-        found = candidates(parsed, lambda tag: index[tag])
-        files = self._read_many(found)
-        return sorted(file_id for file_id, meta in files.items() if matches(parsed, meta.tags))
-
-    def list(self) -> list[FileId]:
-        """Devuelve, ordenados, los IDs de todos los archivos vivos."""
-        answers = self._resolve([self._call(shard, "list_ids") for shard in self._metadata])
-        return sorted(file_id for ids in answers for file_id in ids)
+        files = self._live_files() if expr is None else self._find(expr).values()
+        found = [FileInfo(meta.file_id, meta.name, meta.tags, meta.version) for meta in files]
+        return sorted(found, key=lambda info: info.file_id)
 
     def collect_garbage(self) -> int:
         """Borra de los almacenes el contenido que ningún archivo vivo usa.
@@ -197,6 +202,17 @@ class Gateway:
         for entries in self._ask_every_tag_shard("entries"):
             index.update(entries)
         return check_index(self._live_files(), index)
+
+    def _find(self, expr: str) -> dict[FileId, FileMeta]:
+        """Devuelve las fichas de los archivos vivos que cumplen la consulta.
+
+        El índice solo propone candidatos; la decisión final se toma con las
+        etiquetas actuales de los metadatos, porque el índice puede ir atrasado.
+        """
+        parsed = parse_query(expr)
+        index = self._lookup_many(index_tags(parsed))  # todas las etiquetas a la vez
+        files = self._read_many(candidates(parsed, lambda tag: index[tag]))
+        return {file_id: meta for file_id, meta in files.items() if matches(parsed, meta.tags)}
 
     def _lookup_many(self, tags: Iterable[str]) -> dict[str, set[FileId]]:
         """Devuelve los archivos de cada etiqueta, pidiéndolas todas antes de esperar."""

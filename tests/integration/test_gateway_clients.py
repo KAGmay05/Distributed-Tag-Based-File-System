@@ -79,4 +79,4 @@ def test_concurrent_puts_create_distinct_files(cluster, gateway):
 
     assert len(set(created)) == 20
     assert gateway.query("c3-doc") == sorted(created)
-    assert set(created) <= set(gateway.list())
+    assert set(created) <= {file.file_id for file in gateway.list()}

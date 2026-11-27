@@ -64,6 +64,9 @@ class Model:
         parsed = parse_query(expr)
         return sorted(file_id for file_id, f in self.files.items() if matches(parsed, f.tags))
 
+    def list(self):
+        return [(file_id, f.name, f.tags, f.version) for file_id, f in sorted(self.files.items())]
+
     def live_contents(self):
         return {f.content for f in self.files.values()}
 
@@ -105,7 +108,7 @@ class Client:
 
 def assert_matches_model(gateway, model, queries=QUERIES):
     """Compara todo lo visible del sistema con el modelo."""
-    assert gateway.list() == sorted(model.files)
+    assert gateway.list() == model.list()
     for file_id, expected in model.files.items():
         assert gateway.get(file_id) == expected, file_id
     for file_id in model.deleted:
@@ -152,7 +155,7 @@ def test_full_life_of_the_system_survives_failures():
     copia = gateway.put("copia.jpg", b"bytes de la playa", {"foto", "backup"})
     informe = gateway.put("informe.pdf", b"bytes del informe", {"trabajo", "2024", "borrador"})
 
-    assert gateway.list() == sorted([playa, copia, informe])
+    assert [file.file_id for file in gateway.list()] == sorted([playa, copia, informe])
     assert gateway.get(playa) == ("playa.jpg", b"bytes de la playa", {"foto", "viaje", "2024"}, 1)
     assert gateway.query("foto") == sorted([playa, copia])
     assert gateway.query("2024 AND NOT borrador") == [playa]
@@ -195,7 +198,12 @@ def test_full_life_of_the_system_survives_failures():
 
     with pytest.raises(ContentNotFound):
         gateway._content.get(shared_hash)
-    assert gateway.list() == sorted([informe, nuevo])
+    assert gateway.list() == sorted(
+        [
+            (informe, "informe.pdf", {"trabajo", "2024", "final"}, 3),
+            (nuevo, "nuevo.txt", {"texto", "foto"}, 2),
+        ]
+    )
     assert gateway.get(informe).tags == {"trabajo", "2024", "final"}
 
 
@@ -326,7 +334,7 @@ def test_storage_nodes_fail_one_after_another():
     ray.kill(cluster.storage[second])
     with pytest.raises(ContentNotFound):
         gateway.get(victim)
-    assert victim in gateway.list()
+    assert victim in [file.file_id for file in gateway.list()]
     assert victim in gateway.query("foto")
     client.rename(victim, "victima-renombrada.txt")
     readable = 0
@@ -348,7 +356,7 @@ def test_storage_nodes_fail_one_after_another():
         gateway.put("imposible.txt", b"no hay donde guardarlo", {"foto"})
     with pytest.raises(ContentNotFound):
         gateway.get(after_first)
-    assert gateway.list() == sorted(model.files)
+    assert gateway.list() == model.list()
     client.add_tags(after_first, {"musica"})
     for expr in QUERIES:
         assert gateway.query(expr) == model.query(expr), expr

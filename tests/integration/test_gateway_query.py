@@ -83,7 +83,7 @@ def test_list_returns_live_files_in_order(gateway):
     created = [gateway.put(f"{i}.txt", b"x", {"q8-doc"}) for i in range(10)]
 
     gateway.delete(created[0])
-    listed = gateway.list()
+    listed = [file.file_id for file in gateway.list()]
 
     assert listed == sorted(listed)
     assert set(created[1:]) <= set(listed)
