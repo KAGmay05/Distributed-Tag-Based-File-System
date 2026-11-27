@@ -6,10 +6,12 @@ import pytest
 
 from tagfs.metadata_shard import MetadataShard
 from tagfs.model import FileNotFound
+from tagfs.query import parse_query
 from tagfs.router import shard_for
 from tagfs.tag_shard import TagShard
 
 TAGS = ["foto", "viaje", "2024", "borrador", "trabajo", "familia"]
+QUERIES = ["foto", "foto AND NOT borrador", "viaje OR 2024", "trabajo AND (familia OR NOT 2024)"]
 SEEDS = range(200)
 
 
@@ -50,10 +52,24 @@ def run_random_operations(rng, cluster, steps=60):
     file_ids = []
     for step in range(steps):
         action = rng.choices(
-            ["create", "add_tags", "remove_tags", "rename", "delete"],
-            weights=[3, 4, 4, 1, 1],
+            ["create", "add_tags", "remove_tags", "rename", "delete", "by_query"],
+            weights=[3, 4, 4, 1, 1, 2],
         )[0]
-        if action == "create" or not file_ids:
+        if action == "by_query" and file_ids:
+            # Un índice atrasado puede proponer cualquier archivo: el shard decide.
+            shard = rng.choice(cluster.metadata)
+            mine = [f for f in file_ids if cluster.metadata_for(f) is shard]
+            found = rng.sample(mine, rng.randint(0, len(mine)))
+            expr = parse_query(rng.choice(QUERIES))
+            method = rng.choice(["add_tags", "remove_tags", "delete"])
+            if method == "delete":
+                mutations = shard.delete_matching(found, expr)
+            else:
+                mutations = getattr(shard, f"{method}_matching")(found, expr, random_tags(rng))
+            for mutation in mutations.values():
+                pending.extend(mutation.index_ops)
+            continue
+        if action in ("create", "by_query") or not file_ids:
             file_id = f"file-{step}"
             file_ids.append(file_id)
             mutation = cluster.metadata_for(file_id).create(

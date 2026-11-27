@@ -14,6 +14,7 @@ from tagfs.model import (
     Mutation,
     normalize_tags,
 )
+from tagfs.query import Expr, matches
 
 # Identifica un cambio del outbox: el archivo y la versión que creó. Cada versión
 # de un archivo sale de un único cambio, así que el par no se repite.
@@ -101,6 +102,37 @@ class MetadataShard:
         updated = self._commit(meta, tags=frozenset(), deleted=True)
         return self._record(updated, _index_ops(file_id, meta.tags, False, updated.version))
 
+    def delete_matching(self, file_ids: Iterable[FileId], expr: Expr) -> dict[FileId, Mutation]:
+        """Elimina los archivos de file_ids que cumplen la consulta en este momento.
+
+        file_ids son candidatos que dio el índice: puede ir atrasado, o el archivo
+        pudo cambiar después de consultarlo. Por eso la consulta se vuelve a
+        evaluar aquí, con las etiquetas actuales. El shard atiende una llamada a la
+        vez, así que nadie puede cambiar un archivo entre la comprobación y el
+        cambio. Los que no cumplen, no existen o ya se eliminaron se omiten.
+        """
+        return {file_id: self.delete(file_id) for file_id in self._matching(file_ids, expr)}
+
+    def add_tags_matching(
+        self, file_ids: Iterable[FileId], expr: Expr, tags: Iterable[str]
+    ) -> dict[FileId, Mutation]:
+        """Como delete_matching, pero agrega etiquetas."""
+        normalized = normalize_tags(tags)  # una inválida falla aunque ningún archivo cumpla
+        return {
+            file_id: self.add_tags(file_id, normalized)
+            for file_id in self._matching(file_ids, expr)
+        }
+
+    def remove_tags_matching(
+        self, file_ids: Iterable[FileId], expr: Expr, tags: Iterable[str]
+    ) -> dict[FileId, Mutation]:
+        """Como delete_matching, pero quita etiquetas."""
+        normalized = normalize_tags(tags)
+        return {
+            file_id: self.remove_tags(file_id, normalized)
+            for file_id in self._matching(file_ids, expr)
+        }
+
     def pending(self) -> dict[ChangeId, tuple[IndexOp, ...]]:
         """Devuelve los cambios del outbox que el índice todavía no confirmó.
 
@@ -119,6 +151,10 @@ class MetadataShard:
         """Saca del outbox los cambios que ya llegaron al índice. Repetirlo no falla."""
         for change in changes:
             self._outbox.pop(change, None)
+
+    def _matching(self, file_ids: Iterable[FileId], expr: Expr) -> list[FileId]:
+        live = self.get_many(file_ids)
+        return [file_id for file_id, meta in live.items() if matches(expr, meta.tags)]
 
     def _require_live(self, file_id: FileId) -> FileMeta:
         meta = self._files.get(file_id)

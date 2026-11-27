@@ -62,7 +62,7 @@ def test_concurrent_clients_lose_no_files(cluster):
     gateway = cluster.gateway()
     everything = [file_id for ids in created for file_id in ids]
     assert len(set(everything)) == CLIENTS * FILES_PER_CLIENT
-    assert gateway.list() == sorted(everything)
+    assert [file.file_id for file in gateway.list()] == sorted(everything)
     assert gateway.query("comun") == sorted(everything)
     for client_id, ids in enumerate(created):
         assert gateway.query(f"cliente-{client_id}") == sorted(ids)

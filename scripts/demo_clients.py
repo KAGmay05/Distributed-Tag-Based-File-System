@@ -103,7 +103,7 @@ def main():
 
     gateway = cluster.gateway()
     created = [file_id for result in results for file_id in result["created"]]
-    if gateway.list() != sorted(created):
+    if [file.file_id for file in gateway.list()] != sorted(created):
         raise SystemExit("list() no devuelve exactamente los archivos creados")
 
     print_processes(cluster, results)

@@ -5,7 +5,8 @@ la IP del worker. Un shard muerto o colgado llega como ServiceUnavailable, y a
 tiempo: el cliente no se queda bloqueado.
 
 Matar o colgar un shard de metadatos es definitivo, así que esos tests usan un
-clúster propio con un solo shard de metadatos: todas las operaciones pasan por él.
+clúster propio, casi siempre con un solo shard de metadatos: todas las
+operaciones pasan por él.
 Las funciones y clases que corren en workers se definen dentro de cada test: así
 Ray las envía por valor, porque los workers no pueden importar este módulo.
 """
@@ -131,6 +132,37 @@ def test_hung_metadata_shard_raises_service_unavailable_in_time():
         ray.kill(shard)  # libera el worker, que si no seguiría dormido una hora
 
 
+def test_hung_metadata_shard_puts_its_files_in_unknown_in_a_change_by_query():
+    # Dos shards de metadatos: uno se cuelga y el otro debe hacer su parte.
+    cluster = start_cluster(metadata_shards=2)
+    gateway = cluster.gateway(metadata_timeout=METADATA_TIMEOUT)
+    hung = gateway._metadata[0]
+
+    def on_hung(file_id):
+        return gateway._metadata_for(file_id) is hung
+
+    ids = []
+    while sum(map(on_hung, ids)) < 2 or sum(not on_hung(f) for f in ids) < 2:
+        ids.append(gateway.put(f"{len(ids)}.txt", b"x", {"doc"}))
+    stuck = sorted(f for f in ids if on_hung(f))
+    kept = sorted(f for f in ids if not on_hung(f))
+
+    def hang(self):
+        time.sleep(3600)
+
+    hung.__ray_call__.remote(hang)
+    try:
+        started = time.monotonic()
+        result = gateway.add_tags_by_query("doc", {"masiva"})
+        assert time.monotonic() - started < METADATA_TIMEOUT + MARGIN
+
+        # El shard vivo hace su parte; de los archivos del colgado no se sabe nada.
+        assert result == ({f: 2 for f in kept}, stuck)
+        assert gateway.query("masiva") == kept
+    finally:
+        ray.kill(hung)
+
+
 # --- Shard de etiquetas muerto o colgado ----------------------------------------
 
 
@@ -157,7 +189,7 @@ def test_tag_shard_that_hangs_again_after_its_restart_raises_service_unavailable
         def lookup(self, tag):
             time.sleep(3600)
 
-        def apply(self, op):
+        def apply_many(self, ops):
             time.sleep(3600)
 
     shard = AlwaysHangs.remote()
