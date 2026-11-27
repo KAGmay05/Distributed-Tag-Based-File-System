@@ -197,6 +197,89 @@ class GatewayContract:
         gateway.delete(file_id)
         assert gateway.list("doc") == []
 
+    def test_delete_by_query_deletes_only_the_matching_files(self, gateway):
+        foto = gateway.put("foto.jpg", b"1", {"foto", "2024"})
+        borrador = gateway.put("borrador.jpg", b"2", {"foto", "2024", "borrador"})
+        video = gateway.put("video.mp4", b"3", {"video", "2024"})
+
+        assert gateway.delete_by_query("FOTO AND NOT borrador") == ({foto: 2}, [])
+
+        with pytest.raises(FileNotFound):
+            gateway.get(foto)
+        assert ids(gateway.list()) == sorted([borrador, video])
+        assert gateway.query("2024") == sorted([borrador, video])
+
+    def test_add_tags_by_query_changes_every_matching_file(self, gateway):
+        foto = gateway.put("foto.jpg", b"1", {"foto"})
+        revisada = gateway.put("revisada.jpg", b"2", {"foto", "revisada"})
+        video = gateway.put("video.mp4", b"3", {"video"})
+
+        # revisada.jpg ya tenía la etiqueta: cumple la consulta, pero su versión no cambia.
+        assert gateway.add_tags_by_query("foto", {"Revisada"}) == ({foto: 2, revisada: 1}, [])
+
+        assert gateway.query("revisada") == sorted([foto, revisada])
+        assert gateway.get(video).version == 1
+
+    def test_remove_tags_by_query_changes_every_matching_file(self, gateway):
+        foto = gateway.put("foto.jpg", b"1", {"foto", "2024", "borrador"})
+        video = gateway.put("video.mp4", b"2", {"video", "2024", "borrador"})
+        viejo = gateway.put("viejo.txt", b"3", {"2023", "borrador"})
+
+        assert gateway.remove_tags_by_query("2024", {"BORRADOR"}) == ({foto: 2, video: 2}, [])
+
+        assert gateway.query("borrador") == [viejo]
+        assert gateway.get(foto).tags == {"foto", "2024"}
+
+    def test_repeating_a_change_by_query_has_no_effect(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc", "borrador"})
+
+        assert gateway.remove_tags_by_query("borrador", {"borrador"}) == ({file_id: 2}, [])
+        # El archivo ya no cumple la consulta, así que repetirla no lo toca.
+        assert gateway.remove_tags_by_query("borrador", {"borrador"}) == ({}, [])
+        assert gateway.delete_by_query("doc") == ({file_id: 3}, [])
+        assert gateway.delete_by_query("doc") == ({}, [])
+        assert gateway.add_tags_by_query("doc", {"nueva"}) == ({}, [])
+
+    def test_a_change_by_query_without_matches_changes_nothing(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+
+        assert gateway.delete_by_query("desconocida") == ({}, [])
+        assert gateway.add_tags_by_query("doc AND desconocida", {"nueva"}) == ({}, [])
+        assert gateway.remove_tags_by_query("doc AND NOT doc", {"doc"}) == ({}, [])
+        assert gateway.list() == [(file_id, "a.txt", {"doc"}, 1)]
+
+    def test_a_change_by_query_with_an_invalid_query_or_tag_changes_nothing(self, gateway):
+        file_id = gateway.put("a.txt", b"x", {"doc"})
+
+        for expr in ["", "doc AND", "NOT doc", "doc OR NOT borrador"]:
+            with pytest.raises(InvalidQuery):
+                gateway.delete_by_query(expr)
+            with pytest.raises(InvalidQuery):
+                gateway.add_tags_by_query(expr, {"nueva"})
+            with pytest.raises(InvalidQuery):
+                gateway.remove_tags_by_query(expr, {"doc"})
+        for tags in [{"nueva", "and"}, {"dos palabras"}, "doc"]:
+            with pytest.raises(InvalidTag):
+                gateway.add_tags_by_query("doc", tags)
+            with pytest.raises(InvalidTag):
+                gateway.remove_tags_by_query("doc", tags)
+
+        assert gateway.list() == [(file_id, "a.txt", {"doc"}, 1)]
+
+    def test_index_matches_metadata_after_changes_by_query(self, gateway):
+        created = [gateway.put(f"{i}.txt", b"x", {"doc", f"grupo-{i % 3}"}) for i in range(12)]
+        first, second = sorted(created[0::3]), sorted(created[1::3])
+
+        gateway.add_tags_by_query("grupo-0", {"urgente"})
+        gateway.remove_tags_by_query("grupo-1", {"doc"})
+        gateway.delete_by_query("grupo-2")
+
+        assert gateway.query("urgente") == first
+        assert gateway.query("doc") == first
+        assert ids(gateway.list()) == sorted(first + second)
+        assert gateway.verify_index() == ([], [])
+        assert gateway.repair_index() == 0  # todo llegó al índice: no queda nada pendiente
+
     def test_collect_garbage_removes_only_content_no_live_file_uses(self, gateway):
         first = gateway.put("a.txt", b"igual", {"doc"})
         second = gateway.put("b.txt", b"igual", {"doc"})

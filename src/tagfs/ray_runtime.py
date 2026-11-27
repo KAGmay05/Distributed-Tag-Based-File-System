@@ -80,7 +80,7 @@ def _reachable_live_files(metadata_names: Sequence[str]) -> list[FileMeta]:
 # metadatos. max_restarts=-1: Ray lo arranca de nuevo, con el mismo handle, cada
 # vez que muere su proceso. max_task_retries=-1: las peticiones que estaban en
 # curso se repiten en el actor nuevo, lo que es seguro porque lookup solo lee y
-# apply ignora un cambio que ya conoce.
+# apply_many ignora los cambios que ya conoce.
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class _TagShardActor(_ProcessInfo, TagShard):
     """TagShard que se rellena desde los metadatos cada vez que arranca."""

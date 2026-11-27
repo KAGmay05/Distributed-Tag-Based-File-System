@@ -12,8 +12,16 @@ from ray.exceptions import GetTimeoutError, RayActorError
 
 from tagfs.content import ContentCorrupted, content_hash
 from tagfs.content_store import Reconciliation
-from tagfs.model import FileId, FileInfo, FileMeta, IndexOp, Mutation, normalize_tags
-from tagfs.query import candidates, index_tags, matches, parse_query
+from tagfs.model import (
+    BulkResult,
+    FileId,
+    FileInfo,
+    FileMeta,
+    IndexOp,
+    Mutation,
+    normalize_tags,
+)
+from tagfs.query import Expr, candidates, index_tags, matches, parse_query
 from tagfs.router import shard_for
 from tagfs.tag_shard import IndexCheck, check_index
 
@@ -152,6 +160,33 @@ class Gateway:
         found = [FileInfo(meta.file_id, meta.name, meta.tags, meta.version) for meta in files]
         return sorted(found, key=lambda info: info.file_id)
 
+    def delete_by_query(self, expr: str) -> BulkResult:
+        """Elimina los archivos vivos que cumplen la consulta.
+
+        El índice da los candidatos y cada shard de metadatos vuelve a evaluar la
+        consulta con las etiquetas actuales justo antes de cambiar el archivo: uno
+        que dejó de cumplirla no se toca. Igual que query, no alcanza a un archivo
+        que el índice todavía no conoce.
+
+        Devuelve en done la versión resultante de cada archivo que cumplía la
+        consulta, y en unknown los candidatos de los shards de metadatos que no
+        respondieron: no se sabe si cambiaron. Lo que hicieron los demás shards no
+        se deshace. Si el índice no responde, no hay error: igual que en un cambio
+        de un solo archivo, los cambios quedan pendientes para repair_index.
+        """
+        return self._change_by_query(expr, "delete_matching")
+
+    def add_tags_by_query(self, expr: str, tags: Iterable[str]) -> BulkResult:
+        """Como delete_by_query, pero agrega etiquetas.
+
+        done también incluye los archivos que ya las tenían, con su versión sin cambiar.
+        """
+        return self._change_by_query(expr, "add_tags_matching", normalize_tags(tags))
+
+    def remove_tags_by_query(self, expr: str, tags: Iterable[str]) -> BulkResult:
+        """Como add_tags_by_query, pero quita etiquetas."""
+        return self._change_by_query(expr, "remove_tags_matching", normalize_tags(tags))
+
     def collect_garbage(self) -> int:
         """Borra de los almacenes el contenido que ningún archivo vivo usa.
 
@@ -210,9 +245,33 @@ class Gateway:
         etiquetas actuales de los metadatos, porque el índice puede ir atrasado.
         """
         parsed = parse_query(expr)
-        index = self._lookup_many(index_tags(parsed))  # todas las etiquetas a la vez
-        files = self._read_many(candidates(parsed, lambda tag: index[tag]))
+        files = self._read_many(self._candidates(parsed))
         return {file_id: meta for file_id, meta in files.items() if matches(parsed, meta.tags)}
+
+    def _candidates(self, parsed: Expr) -> set[FileId]:
+        """Devuelve los posibles archivos de la consulta según el índice."""
+        index = self._lookup_many(index_tags(parsed))  # todas las etiquetas a la vez
+        return candidates(parsed, lambda tag: index[tag])
+
+    def _change_by_query(self, expr: str, method: str, *args: Any) -> BulkResult:
+        """Pide el cambio, a la vez, a cada shard de metadatos que tiene candidatos."""
+        parsed = parse_query(expr)
+        by_shard = self._group_by_metadata_shard(self._candidates(parsed))
+        sent = {
+            index: self._call(self._metadata[index], method, ids, parsed, *args)
+            for index, ids in by_shard.items()
+        }
+        answers = self._resolve_each(sent)
+        self._deliver(answers)
+        done = {
+            file_id: mutation.version
+            for mutations in answers.values()
+            for file_id, mutation in mutations.items()
+        }
+        unknown = [
+            file_id for index, ids in by_shard.items() if index not in answers for file_id in ids
+        ]
+        return BulkResult(dict(sorted(done.items())), sorted(unknown))
 
     def _lookup_many(self, tags: Iterable[str]) -> dict[str, set[FileId]]:
         """Devuelve los archivos de cada etiqueta, pidiéndolas todas antes de esperar."""
@@ -232,46 +291,87 @@ class Gateway:
 
     def _read_many(self, file_ids: Iterable[FileId]) -> dict[FileId, FileMeta]:
         # Una sola llamada por shard, y todas a la vez, en lugar de una por archivo.
-        by_shard: dict[int, list[FileId]] = defaultdict(list)
-        for file_id in file_ids:
-            by_shard[shard_for(file_id, len(self._metadata))].append(file_id)
+        by_shard = self._group_by_metadata_shard(file_ids)
         refs = [self._call(self._metadata[index], "get_many", ids) for index, ids in by_shard.items()]
         files: dict[FileId, FileMeta] = {}
         for answer in self._resolve(refs):
             files.update(answer)
         return files
 
+    def _group_by_metadata_shard(self, file_ids: Iterable[FileId]) -> dict[int, list[FileId]]:
+        by_shard: dict[int, list[FileId]] = defaultdict(list)
+        for file_id in file_ids:
+            by_shard[self._metadata_index(file_id)].append(file_id)
+        return by_shard
+
+    def _resolve_each(self, sent: dict[int, Any]) -> dict[int, Any]:
+        """Espera por separado la respuesta de cada shard de metadatos.
+
+        Devuelve solo las de los shards que respondieron, para que la caída de uno
+        no oculte lo que ya hicieron los demás.
+        """
+        if not self._remote:
+            return sent
+        answers: dict[int, Any] = {}
+        for index, ref in sent.items():
+            try:
+                answers[index] = ray.get(ref)
+            except RayActorError:  # el shard murió
+                continue
+        return answers
+
     def _change(self, file_id: FileId, method: str, *args: Any) -> int:
         """Hace un cambio en los metadatos, lo lleva al índice y devuelve la versión."""
-        shard = self._metadata_for(file_id)
-        mutation = self._resolve(self._call(shard, method, file_id, *args))
-        if mutation.index_ops:
-            self._deliver(shard, file_id, mutation)
+        index = self._metadata_index(file_id)
+        mutation = self._resolve(self._call(self._metadata[index], method, file_id, *args))
+        self._deliver({index: {file_id: mutation}})
         return mutation.version
 
-    def _deliver(self, shard: Any, file_id: FileId, mutation: Mutation) -> None:
-        """Lleva un cambio al índice y lo saca del outbox de su shard de metadatos.
+    def _deliver(self, changes: dict[int, dict[FileId, Mutation]]) -> None:
+        """Lleva cambios al índice y los saca del outbox de sus shards de metadatos.
 
-        Si el índice no responde, no se lanza error: el cambio ya está hecho
-        porque lo aceptaron los metadatos, y sigue en el outbox para repair_index.
+        changes agrupa los cambios por shard de metadatos. Van todos juntos al
+        índice, con una llamada por TagShard. Si el índice no responde, no se
+        lanza error: los cambios ya están hechos porque los aceptaron los
+        metadatos, y siguen en el outbox para repair_index. En ese caso no se
+        saca ninguno, aunque algún TagShard sí los recibiera: entregar dos veces
+        un cambio no tiene efecto.
         """
+        ops: list[IndexOp] = []
+        to_ack: dict[int, list[tuple[FileId, int]]] = defaultdict(list)
+        for index, mutations in changes.items():
+            for file_id, mutation in mutations.items():
+                if mutation.index_ops:  # un cambio sin efecto no entró en el outbox
+                    ops.extend(mutation.index_ops)
+                    to_ack[index].append((file_id, mutation.version))
+        if not ops:
+            return
         try:
-            self._send_to_index(mutation.index_ops)
+            self._send_to_index(ops)
         except _INDEX_UNAVAILABLE:
             return
-        self._resolve(self._call(shard, "ack", [(file_id, mutation.version)]))
+        self._resolve(
+            [self._call(self._metadata[index], "ack", acks) for index, acks in to_ack.items()]
+        )
 
     def _send_to_index(self, ops: Iterable[IndexOp]) -> None:
-        if not self._remote:
-            for op in ops:
-                self._tag_shard_for(op.tag).apply(op)
-            return
-        sent: dict[int, list[Any]] = defaultdict(list)
+        """Entrega los cambios al índice, con una sola llamada por TagShard y todas a la vez.
+
+        Con una llamada por cambio, entregar miles tardaría más que index_timeout
+        y el gateway reiniciaría un TagShard sano.
+        """
+        by_shard: dict[int, list[IndexOp]] = defaultdict(list)
         for op in ops:
-            index = self._tag_index(op.tag)
-            sent[index].append(self._tags[index].apply.remote(op))
-        for index, refs in sent.items():
-            self._wait_for_index(index, refs)
+            by_shard[self._tag_index(op.tag)].append(op)
+        if not self._remote:
+            for index, group in by_shard.items():
+                self._tags[index].apply_many(group)
+            return
+        sent = {
+            index: self._tags[index].apply_many.remote(group) for index, group in by_shard.items()
+        }
+        for index, ref in sent.items():
+            self._wait_for_index(index, [ref])
 
     def _wait_for_index(self, index: int, refs: list[Any]) -> list[Any]:
         """Espera las respuestas de un TagShard; si no llegan a tiempo, lo reinicia.
@@ -279,7 +379,7 @@ class Gateway:
         Un shard muerto y uno colgado se ven igual desde fuera. Con no_restart=False,
         Ray lo reinicia con el mismo handle, el actor nuevo se rellena desde los
         metadatos y Ray le repite las peticiones pendientes. Repetirlas es seguro:
-        lookup solo lee y apply ignora un cambio que ya conoce.
+        lookup solo lee y apply_many ignora los cambios que ya conoce.
         """
         try:
             return ray.get(refs, timeout=self._index_timeout)
@@ -306,7 +406,10 @@ class Gateway:
         return ray.get(result) if self._remote else result
 
     def _metadata_for(self, file_id: FileId) -> Any:
-        return self._metadata[shard_for(file_id, len(self._metadata))]
+        return self._metadata[self._metadata_index(file_id)]
+
+    def _metadata_index(self, file_id: FileId) -> int:
+        return shard_for(file_id, len(self._metadata))
 
     def _tag_shard_for(self, tag: str) -> Any:
         return self._tags[self._tag_index(tag)]

@@ -11,12 +11,14 @@ envía por valor, porque los workers no pueden importar este módulo.
 
 import os
 import time
+from itertools import count
 
 import pytest
 import ray
 
 from tagfs.gateway import Gateway
 from tagfs.ray_runtime import run_in_workers, start_cluster
+from tagfs.router import shard_for
 from tagfs.tag_shard import TagShard
 
 
@@ -39,11 +41,13 @@ def crash_index_of(gateway, tag):
 # Estas dos funciones esperan a que la caída o el reinicio hayan ocurrido de verdad.
 
 
-def wait_until_dead(actor, seconds=30):
+def wait_until_dead(actor, seconds=30, probe=None):
+    # probe hace una llamada cualquiera al actor; por defecto, pid.
+    probe = probe or actor.pid.remote
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         try:
-            ray.get(actor.pid.remote(), timeout=seconds)
+            ray.get(probe(), timeout=seconds)
         except ray.exceptions.RayActorError:
             return
         time.sleep(0.1)
@@ -213,6 +217,31 @@ def test_a_change_the_index_did_not_receive_is_delivered_by_repair(cluster):
     assert gateway.repair_index() >= 1
     assert gateway.query("i9-doc") == [file_id]
     assert gateway.repair_index() == 0
+
+
+def test_changes_by_query_the_index_did_not_receive_are_delivered_by_repair(cluster):
+    gateway = cluster.gateway()
+    # Un gateway con dos TagShard: el de la consulta es el real del clúster y el de
+    # la etiqueta nueva está muerto para siempre.
+    searched = next(tag for tag in (f"i11-doc-{n}" for n in count()) if shard_for(tag, 2) == 0)
+    added = next(tag for tag in (f"i11-nueva-{n}" for n in count()) if shard_for(tag, 2) == 1)
+    unreachable = ray.remote(TagShard).remote()
+    ray.kill(unreachable)
+    wait_until_dead(unreachable, probe=lambda: unreachable.lookup.remote(added))
+    cut_off = Gateway(
+        [p.handle for p in cluster.metadata],
+        [gateway._tag_shard_for(searched), unreachable],
+        cluster.content_store(),
+    )
+    created = sorted(gateway.put(f"{i}.txt", b"x", {searched}) for i in range(5))
+
+    # No falla: los metadatos aceptaron los cambios.
+    assert cut_off.add_tags_by_query(searched, {added}) == ({f: 2 for f in created}, [])
+
+    assert [f.tags for f in gateway.list(searched)] == [{searched, added}] * 5
+    assert gateway.query(added) == []
+    assert gateway.repair_index() >= 5
+    assert gateway.query(added) == created
 
 
 def test_a_client_that_dies_before_telling_the_index_is_repaired(cluster):

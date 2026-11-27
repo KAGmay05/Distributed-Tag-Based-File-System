@@ -52,10 +52,25 @@ class CountingShard(MetadataShard):
     def __init__(self):
         super().__init__()
         self.get_many_calls = 0
+        self.delete_matching_calls = 0
 
     def get_many(self, file_ids):
         self.get_many_calls += 1
         return super().get_many(file_ids)
+
+    def delete_matching(self, file_ids, expr):
+        self.delete_matching_calls += 1
+        return super().delete_matching(file_ids, expr)
+
+
+class CountingTagShard(TagShard):
+    def __init__(self):
+        super().__init__()
+        self.apply_many_calls = 0
+
+    def apply_many(self, ops):
+        self.apply_many_calls += 1
+        super().apply_many(ops)
 
 
 @pytest.mark.parametrize("tags", [{"valida", "or"}, {"valida", 2024}, "foto"])
@@ -160,6 +175,34 @@ def test_query_filters_stale_index_entries_with_metadata():
     assert gateway.query("doc") == []
 
 
+def test_a_change_by_query_checks_the_query_again_in_the_metadata():
+    gateway, metadata, _ = build_gateway()
+    file_id = gateway.put("a.txt", b"x", {"doc", "foto"})
+    # Los metadatos pierden "doc" sin avisar al índice, que lo sigue dando como candidato.
+    metadata[shard_for(file_id, len(metadata))].remove_tags(file_id, {"doc"})
+
+    assert gateway.delete_by_query("doc") == ({}, [])
+    assert gateway.add_tags_by_query("doc", {"nueva"}) == ({}, [])
+
+    assert gateway.get(file_id).tags == {"foto"}
+
+
+def test_a_change_by_query_calls_each_shard_once():
+    metadata = [CountingShard() for _ in range(3)]
+    tags = [CountingTagShard() for _ in range(4)]
+    gateway = Gateway(metadata, tags, FakeContentStore())
+    created = [gateway.put(f"{i}.txt", b"x", {"doc"}) for i in range(30)]
+    before = [shard.apply_many_calls for shard in tags]
+
+    assert gateway.delete_by_query("doc") == ({file_id: 2 for file_id in created}, [])
+
+    assert [shard.delete_matching_calls for shard in metadata] == [1, 1, 1]
+    # Los 30 cambios del índice son de "doc" y llegan a su TagShard en una sola llamada.
+    home = shard_for("doc", len(tags))
+    calls = [shard.apply_many_calls - old for shard, old in zip(tags, before)]
+    assert calls == [1 if index == home else 0 for index in range(len(tags))]
+
+
 def test_stored_file_supports_attributes_and_tuple_access():
     gateway, _, _ = build_gateway()
     file_id = gateway.put("a.txt", b"x")
@@ -228,6 +271,33 @@ def test_a_change_left_out_of_the_index_is_delivered_by_repair(
         [(tag, file_id) for tag in extra_tags],
     )
     assert gateway.repair_index() == 1
+    assert gateway.verify_index() == ([], [])
+
+
+@pytest.mark.parametrize(
+    "operation,args,missing_tags,extra_tags",
+    [
+        ("add_tags_by_query", ({"urgente"},), ["urgente"], []),
+        ("remove_tags_by_query", ({"doc"},), [], ["doc"]),
+        ("delete_by_query", (), [], ["doc"]),
+    ],
+)
+def test_changes_by_query_left_out_of_the_index_are_delivered_by_repair(
+    operation, args, missing_tags, extra_tags
+):
+    store = FakeContentStore()
+    gateway, metadata, tags = build_gateway(store)
+    created = sorted(gateway.put(f"{i}.txt", b"x", {"doc"}) for i in range(10))
+    crashing = stop_before_the_index(Gateway(metadata, tags, store))
+
+    with pytest.raises(ClientStopped):
+        getattr(crashing, operation)("doc", *args)
+
+    assert gateway.verify_index() == (
+        [(tag, file_id) for tag in missing_tags for file_id in created],
+        [(tag, file_id) for tag in extra_tags for file_id in created],
+    )
+    assert gateway.repair_index() == 10
     assert gateway.verify_index() == ([], [])
 
 

@@ -7,6 +7,7 @@ y muchas consultas) con el modelo, no solo lo que acaba de cambiar.
 
 import os
 import random
+import time
 
 import pytest
 import ray
@@ -488,3 +489,27 @@ def test_random_operations_with_random_failures(seed):
 
     gateway.collect_garbage()
     assert_matches_model(gateway, model)
+
+
+def test_a_change_by_query_reports_the_files_of_a_dead_metadata_shard_as_unknown():
+    cluster = start_cluster()
+    gateway = cluster.gateway()
+    victim = gateway._metadata[0]
+    ids = []
+    while sum(gateway._metadata_for(f) is victim for f in ids) < 2 or len(ids) < 10:
+        ids.append(gateway.put(f"{len(ids)}.txt", b"x", {"doc"}))
+    lost = sorted(f for f in ids if gateway._metadata_for(f) is victim)
+    kept = sorted(f for f in ids if gateway._metadata_for(f) is not victim)
+
+    ray.kill(victim)
+    deadline = time.monotonic() + 30
+    with pytest.raises(RayActorError):  # ray.kill no espera: se comprueba que ya murió
+        while time.monotonic() < deadline:
+            ray.get(victim.pid.remote())
+
+    # Los shards vivos hacen su parte; de los archivos del muerto no se sabe nada.
+    result = gateway.add_tags_by_query("doc", {"masiva"})
+    assert result == ({f: 2 for f in kept}, lost)
+    assert gateway.query("masiva") == kept
+    # unknown solo trae candidatos del índice: con "masiva" no hay ninguno del shard muerto.
+    assert gateway.delete_by_query("masiva") == ({f: 3 for f in kept}, [])
