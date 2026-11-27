@@ -1,5 +1,6 @@
 import pytest
 from gateway_contract import GatewayContract
+from maintenance_checks import MaintenanceChecks
 
 from tagfs.content import ContentCorrupted
 from tagfs.fake_content_store import FakeContentStore
@@ -17,6 +18,12 @@ def build_gateway(content=None, metadata_shards=3, tag_shards=4):
 
 
 class TestInMemoryGateway(GatewayContract):
+    @pytest.fixture
+    def gateway(self):
+        return build_gateway()[0]
+
+
+class TestInMemoryMaintenance(MaintenanceChecks):
     @pytest.fixture
     def gateway(self):
         return build_gateway()[0]

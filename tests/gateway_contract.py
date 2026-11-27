@@ -2,6 +2,10 @@
 
 Cada implementación hereda GatewayContract y aporta el fixture `gateway`. La
 clase no empieza por "Test", así que pytest solo ejecuta sus herederas.
+
+Solo cubre las operaciones de los clientes. Las de mantenimiento
+(collect_garbage, reconcile, repair_index y verify_index) no son parte del
+contrato: sus garantías se prueban en maintenance_checks.py.
 """
 
 import pytest
@@ -56,7 +60,6 @@ class GatewayContract:
         assert ids(gateway.list()) == [file_id]
         assert gateway.get(file_id) == ("a.txt", b"x", {"doc"}, 1)
         assert gateway.query("valida") == []
-        assert gateway.collect_garbage() == 0  # el put rechazado no dejó bytes
 
     def test_a_string_is_not_a_collection_of_tags(self, gateway):
         # Sin esta regla, "foto" se guardaría como las etiquetas f, o y t.
@@ -70,7 +73,6 @@ class GatewayContract:
             gateway.remove_tags(file_id, "doc")
 
         assert gateway.list() == [(file_id, "a.txt", {"doc"}, 1)]
-        assert gateway.collect_garbage() == 0
 
     def test_a_name_must_be_text(self, gateway):
         file_id = gateway.put("a.txt", b"x", {"doc"})
@@ -82,7 +84,6 @@ class GatewayContract:
                 gateway.rename(file_id, name)
 
         assert gateway.list() == [(file_id, "a.txt", {"doc"}, 1)]
-        assert gateway.collect_garbage() == 0
 
     def test_invalid_query_is_rejected(self, gateway):
         for expr in ["", "doc AND", "(doc", "NOT doc", "doc OR NOT borrador"]:
@@ -266,7 +267,7 @@ class GatewayContract:
 
         assert gateway.list() == [(file_id, "a.txt", {"doc"}, 1)]
 
-    def test_index_matches_metadata_after_changes_by_query(self, gateway):
+    def test_queries_follow_changes_by_query(self, gateway):
         created = [gateway.put(f"{i}.txt", b"x", {"doc", f"grupo-{i % 3}"}) for i in range(12)]
         first, second = sorted(created[0::3]), sorted(created[1::3])
 
@@ -276,34 +277,5 @@ class GatewayContract:
 
         assert gateway.query("urgente") == first
         assert gateway.query("doc") == first
+        assert gateway.query("grupo-2") == []
         assert ids(gateway.list()) == sorted(first + second)
-        assert gateway.verify_index() == ([], [])
-        assert gateway.repair_index() == 0  # todo llegó al índice: no queda nada pendiente
-
-    def test_collect_garbage_removes_only_content_no_live_file_uses(self, gateway):
-        first = gateway.put("a.txt", b"igual", {"doc"})
-        second = gateway.put("b.txt", b"igual", {"doc"})
-        alone = gateway.put("c.txt", b"solo", {"doc"})
-
-        gateway.delete(first)
-        gateway.delete(alone)
-
-        assert gateway.collect_garbage() == 1  # b"solo"; b"igual" lo sigue usando second
-        assert gateway.get(second).content == b"igual"
-
-    def test_index_matches_metadata_after_every_kind_of_change(self, gateway):
-        kept = gateway.put("a.txt", b"x", {"doc", "foto"})
-        changed = gateway.put("b.txt", b"y", {"doc"})
-        gateway.add_tags(kept, {"urgente"})
-        gateway.remove_tags(kept, {"foto"})
-        gateway.rename(kept, "c.txt")
-        gateway.delete(changed)
-
-        assert gateway.verify_index() == ([], [])
-        assert gateway.repair_index() == 0  # todo llegó al índice: no queda nada pendiente
-
-    def test_reconcile_without_failures_changes_nothing(self, gateway):
-        file_id = gateway.put("a.txt", b"x", {"doc"})
-
-        assert gateway.reconcile() == ([], 0, 0, 0, [])
-        assert gateway.get(file_id).content == b"x"

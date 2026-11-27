@@ -107,6 +107,61 @@ def test_changes_reach_the_index_after_its_tag_shard_dies(gateway, operation):
     assert gateway.query(tag) == sorted(expected)
 
 
+@pytest.mark.parametrize("operation", ["add", "remove", "delete"])
+def test_changes_by_query_reach_the_index_after_its_tag_shard_dies(gateway, operation):
+    tag, group = f"i12-{operation}", f"i12-{operation}-grupo"
+    kept = gateway.put("kept.txt", b"k", {tag})
+    changed = [
+        gateway.put(f"{i}.txt", b"c", {group} if operation == "add" else {group, tag})
+        for i in range(5)
+    ]
+    crash_index_of(gateway, tag)
+
+    if operation == "add":
+        result = gateway.add_tags_by_query(group, {tag})
+        expected = [kept, *changed]
+    elif operation == "remove":
+        result = gateway.remove_tags_by_query(group, {tag})
+        expected = [kept]
+    else:
+        result = gateway.delete_by_query(group)
+        expected = [kept]
+
+    assert result == ({file_id: 2 for file_id in changed}, [])
+    assert gateway.query(tag) == sorted(expected)
+    assert raw_index(gateway, tag) == set(expected)  # ninguna entrada de más
+
+
+def test_a_change_by_query_sends_one_batch_to_each_tag_shard():
+    # Con una llamada por cambio, entregar miles de cambios tardaría más que
+    # index_timeout y el gateway reiniciaría un TagShard que funciona.
+    # Usa su propio clúster, como el test del shard colgado.
+    cluster = start_cluster(metadata_shards=2, tag_shards=1, storage_nodes=1, replication_factor=1)
+
+    @ray.remote
+    class CountingTagShard(TagShard):
+        def __init__(self):
+            super().__init__()
+            self._batches = []
+
+        def apply_many(self, ops):
+            ops = list(ops)
+            self._batches.append(len(ops))
+            super().apply_many(ops)
+
+        def batches(self):
+            return self._batches
+
+    shard = CountingTagShard.remote()
+    gateway = Gateway([p.handle for p in cluster.metadata], [shard], cluster.content_store())
+    created = sorted(gateway.put(f"{i}.txt", b"x", {"i14-doc"}) for i in range(50))
+
+    assert gateway.add_tags_by_query("i14-doc", {"i14-nueva"}) == ({f: 2 for f in created}, [])
+
+    assert ray.get(shard.batches.remote()) == [1] * 50 + [50]  # un lote por put y uno para todo
+    assert gateway.query("i14-nueva") == created
+
+
 def test_rebuilt_index_leaves_out_deleted_files_and_removed_tags(gateway):
     live = gateway.put("vivo.txt", b"1", {"i4-doc"})
     deleted = gateway.put("borrado.txt", b"2", {"i4-doc"})
@@ -125,7 +180,8 @@ def test_only_the_dead_tag_shard_restarts_and_keeps_its_handle(gateway):
     handles = list(gateway._tags)
     before = ray.get([shard.pid.remote() for shard in handles])
 
-    crash_index_of(gateway, "i5-doc")
+    # Se espera al reinicio: justo después de ray.kill aún puede responder el proceso viejo.
+    crash_index_and_wait_for_restart(gateway, "i5-doc")
     gateway.query("i5-doc")
 
     after = ray.get([shard.pid.remote() for shard in gateway._tags])
@@ -183,6 +239,55 @@ def test_a_tag_shard_that_stops_answering_is_restarted(cluster):
 
     assert gateway.query("i7-doc") == []
     assert ray.get(starts.read.remote()) == 2  # se reinició una vez
+
+
+def test_a_tag_shard_that_hangs_during_a_change_by_query_is_restarted():
+    # Usa su propio clúster: sus archivos no llegan nunca al índice del clúster, y
+    # el verify_index de otros tests los contaría como entradas que faltan.
+    cluster = start_cluster(metadata_shards=2, tag_shards=1, storage_nodes=1, replication_factor=1)
+
+    @ray.remote
+    class Starts:
+        def __init__(self):
+            self.count = 0
+
+        def add(self):
+            self.count += 1
+            return self.count
+
+        def read(self):
+            return self.count
+
+    @ray.remote(max_restarts=-1, max_task_retries=-1)
+    class HangsOnTheFirstBatch(TagShard):
+        # Se cuelga con el primer lote de más de un cambio; tras reiniciarse responde.
+        # A diferencia de los TagShard de start_cluster, no se rellena al reiniciarse.
+        def __init__(self, starts):
+            super().__init__()
+            self._first = ray.get(starts.add.remote()) == 1
+
+        def ready(self):
+            return True
+
+        def apply_many(self, ops):
+            ops = list(ops)
+            if self._first and len(ops) > 1:
+                time.sleep(3600)
+            super().apply_many(ops)
+
+    starts = Starts.remote()
+    shard = HangsOnTheFirstBatch.remote(starts)
+    ray.get(shard.ready.remote())
+    gateway = Gateway(
+        [p.handle for p in cluster.metadata], [shard], cluster.content_store(), index_timeout=1
+    )
+    created = sorted(gateway.put(f"{i}.txt", b"x", {"i15-doc"}) for i in range(5))
+
+    # El cliente no ve el fallo: el gateway reinicia el shard y Ray le repite el lote.
+    assert gateway.add_tags_by_query("i15-doc", {"i15-nueva"}) == ({f: 2 for f in created}, [])
+
+    assert ray.get(starts.read.remote()) == 2  # se reinició una vez
+    assert gateway.query("i15-nueva") == created
 
 
 def test_a_tag_shard_restarts_even_after_a_metadata_shard_died():
@@ -262,3 +367,24 @@ def test_a_client_that_dies_before_telling_the_index_is_repaired(cluster):
 
     assert gateway.query("i10-doc") == [file_id]
     assert gateway.verify_index() == ([], [])
+
+
+def test_a_client_that_dies_in_the_middle_of_a_change_by_query_is_repaired(cluster):
+    gateway = cluster.gateway()
+    created = sorted(gateway.put(f"{i}.txt", b"x", {"i13-doc"}) for i in range(5))
+
+    def client_that_dies_halfway(cluster):
+        client = cluster.gateway()
+        client._send_to_index = lambda ops: os._exit(1)  # muere justo antes de avisar al índice
+        client.add_tags_by_query("i13-doc", {"i13-nueva"})
+
+    with pytest.raises(ray.exceptions.WorkerCrashedError):
+        run_in_workers(client_that_dies_halfway, [(cluster,)])
+
+    # Los metadatos ya tienen los cambios, pero el índice no.
+    assert [f.tags for f in gateway.list("i13-doc")] == [{"i13-doc", "i13-nueva"}] * 5
+    assert gateway.query("i13-nueva") == []
+
+    assert gateway.repair_index() >= 5
+
+    assert gateway.query("i13-nueva") == created

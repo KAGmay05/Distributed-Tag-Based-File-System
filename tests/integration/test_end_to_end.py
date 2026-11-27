@@ -61,6 +61,18 @@ class Model:
         self.files.pop(file_id, None)
         self.deleted.add(file_id)
 
+    def add_tags_by_query(self, expr, tags):
+        return {file_id: self.add_tags(file_id, tags) for file_id in self.query(expr)}
+
+    def remove_tags_by_query(self, expr, tags):
+        return {file_id: self.remove_tags(file_id, tags) for file_id in self.query(expr)}
+
+    def delete_by_query(self, expr):
+        done = {file_id: self.files[file_id].version + 1 for file_id in self.query(expr)}
+        for file_id in done:
+            self.delete(file_id)
+        return done
+
     def query(self, expr):
         parsed = parse_query(expr)
         return sorted(file_id for file_id, f in self.files.items() if matches(parsed, f.tags))
@@ -105,6 +117,18 @@ class Client:
     def delete(self, file_id):
         assert self.gateway.delete(file_id) is None
         self.model.delete(file_id)
+
+    def add_tags_by_query(self, expr, tags):
+        expected = self.model.add_tags_by_query(expr, tags)
+        assert self.gateway.add_tags_by_query(expr, tags) == (expected, []), expr
+
+    def remove_tags_by_query(self, expr, tags):
+        expected = self.model.remove_tags_by_query(expr, tags)
+        assert self.gateway.remove_tags_by_query(expr, tags) == (expected, []), expr
+
+    def delete_by_query(self, expr):
+        expected = self.model.delete_by_query(expr)
+        assert self.gateway.delete_by_query(expr) == (expected, []), expr
 
 
 def assert_matches_model(gateway, model, queries=QUERIES):
@@ -460,8 +484,11 @@ def test_random_operations_with_random_failures(seed):
     for step in range(80):
         live = sorted(model.files)
         action = rng.choices(
-            ["put", "add", "remove", "rename", "delete", "missing", "gc", "kill_tags", "kill_storage"],
-            weights=[5, 3, 3, 1, 2, 1, 1, 1, 1],
+            [
+                "put", "add", "remove", "rename", "delete", "missing", "gc", "kill_tags",
+                "kill_storage", "add_by_query", "remove_by_query", "delete_by_query",
+            ],
+            weights=[5, 3, 3, 1, 2, 1, 1, 1, 1, 2, 2, 1],
         )[0]
         if action == "put" or not live:
             client.put(f"{step}.dat", rng.choice(CONTENTS), random_tags(rng))
@@ -473,6 +500,12 @@ def test_random_operations_with_random_failures(seed):
             client.rename(rng.choice(live), f"renombrado-{step}.dat")
         elif action == "delete":
             client.delete(rng.choice(live))
+        elif action == "add_by_query":
+            client.add_tags_by_query(rng.choice(QUERIES), random_tags(rng))
+        elif action == "remove_by_query":
+            client.remove_tags_by_query(rng.choice(QUERIES), random_tags(rng))
+        elif action == "delete_by_query":
+            client.delete_by_query(rng.choice(QUERIES))
         elif action == "missing":
             target = rng.choice(sorted(model.deleted) or ["no-existe"])
             with pytest.raises(FileNotFound):
