@@ -30,6 +30,14 @@ class InvalidQuery(TagFSError, ValueError):
     """La consulta tiene un error de sintaxis o no tiene parte positiva."""
 
 
+class ServiceUnavailable(TagFSError):
+    """Una parte del sistema no respondió: murió o no contestó a tiempo.
+
+    Si ocurre durante un cambio, el cambio puede haberse hecho o no: un shard
+    colgado puede aplicarlo cuando vuelva a responder.
+    """
+
+
 @dataclass(frozen=True)
 class FileMeta:
     file_id: FileId

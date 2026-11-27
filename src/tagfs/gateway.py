@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections import defaultdict
 from typing import Any, Collection, Iterable, NamedTuple, Protocol, Sequence
 
 import ray
 from ray.actor import ActorHandle
-from ray.exceptions import GetTimeoutError, RayActorError
+from ray.exceptions import GetTimeoutError, RayActorError, RayTaskError
 
 from tagfs.content import ContentCorrupted, content_hash
 from tagfs.content_store import Reconciliation
@@ -19,15 +20,13 @@ from tagfs.model import (
     FileMeta,
     IndexOp,
     Mutation,
+    ServiceUnavailable,
+    TagFSError,
     normalize_tags,
 )
 from tagfs.query import Expr, candidates, index_tags, matches, parse_query
 from tagfs.router import shard_for
 from tagfs.tag_shard import IndexCheck, check_index
-
-# Un TagShard muerto que no se pudo reiniciar, o uno que no respondió ni después de reiniciarlo.
-_INDEX_UNAVAILABLE = (RayActorError, GetTimeoutError)
-
 
 class ContentAPI(Protocol):
     """Lo que el gateway necesita de un almacén de contenido."""
@@ -49,6 +48,27 @@ def _verify(content: bytes, expected_hash: str) -> None:
 def _check_name(name: str) -> None:
     if not isinstance(name, str):
         raise TypeError(f"El nombre debe ser texto, no {type(name).__name__}")
+
+
+def _get(refs: Any, timeout: float, what: str) -> Any:
+    """ray.get que traduce los errores de Ray a los del sistema.
+
+    Un error de nuestro código lanzado dentro de un actor llega envuelto en un
+    RayTaskError que también hereda de la clase original y trae en el mensaje el
+    PID y la IP del worker. Se lanza el original, sin envoltorio. Un actor muerto
+    o que no responde a tiempo se convierte en ServiceUnavailable.
+
+    No se captura RayError en general: el RayTaskError de un FileNotFound también
+    lo es, y se convertiría en ServiceUnavailable.
+    """
+    try:
+        return ray.get(refs, timeout=timeout)
+    except RayTaskError as error:
+        if isinstance(error.cause, TagFSError):
+            raise error.cause from None
+        raise
+    except (RayActorError, GetTimeoutError) as error:
+        raise ServiceUnavailable(f"{what} no responde") from error
 
 
 class StoredFile(NamedTuple):
@@ -78,6 +98,10 @@ class Gateway:
     Si un TagShard no responde a tiempo, el gateway pide a Ray que lo reinicie.
     Los TagShard de start_cluster se reinician con el mismo handle y se rellenan
     desde los metadatos, así que la reparación sirve a todos los clientes.
+
+    El cliente nunca ve errores de Ray. Si un shard muere o no responde, recibe
+    ServiceUnavailable: tras metadata_timeout segundos en los metadatos, y en el
+    índice cuando tampoco responde tras reiniciarlo.
     """
 
     def __init__(
@@ -86,6 +110,7 @@ class Gateway:
         tags: Sequence[Any],
         content: ContentAPI,
         *,
+        metadata_timeout: float = 10.0,
         index_timeout: float = 5.0,
         restart_timeout: float = 120.0,
     ) -> None:
@@ -100,6 +125,7 @@ class Gateway:
         self._metadata = list(metadata)
         self._tags = list(tags)
         self._content = content
+        self._metadata_timeout = metadata_timeout
         self._index_timeout = index_timeout
         self._restart_timeout = restart_timeout
 
@@ -308,15 +334,19 @@ class Gateway:
         """Espera por separado la respuesta de cada shard de metadatos.
 
         Devuelve solo las de los shards que respondieron, para que la caída de uno
-        no oculte lo que ya hicieron los demás.
+        no oculte lo que ya hicieron los demás. Un shard muerto y uno que no
+        responde en metadata_timeout se tratan igual. El plazo es uno solo para
+        todos: con dos shards colgados no se espera el doble.
         """
         if not self._remote:
             return sent
+        deadline = time.monotonic() + self._metadata_timeout
         answers: dict[int, Any] = {}
         for index, ref in sent.items():
+            remaining = max(0.0, deadline - time.monotonic())
             try:
-                answers[index] = ray.get(ref)
-            except RayActorError:  # el shard murió
+                answers[index] = _get(ref, remaining, f"El shard de metadatos {index}")
+            except ServiceUnavailable:
                 continue
         return answers
 
@@ -331,11 +361,11 @@ class Gateway:
         """Lleva cambios al índice y los saca del outbox de sus shards de metadatos.
 
         changes agrupa los cambios por shard de metadatos. Van todos juntos al
-        índice, con una llamada por TagShard. Si el índice no responde, no se
-        lanza error: los cambios ya están hechos porque los aceptaron los
-        metadatos, y siguen en el outbox para repair_index. En ese caso no se
-        saca ninguno, aunque algún TagShard sí los recibiera: entregar dos veces
-        un cambio no tiene efecto.
+        índice, con una llamada por TagShard. Si el índice o el ack no responden,
+        no se lanza error: los cambios ya están hechos porque los aceptaron los
+        metadatos, y siguen en el outbox para repair_index. Si el índice no
+        responde no se saca ninguno, aunque algún TagShard sí los recibiera:
+        entregar dos veces un cambio no tiene efecto.
         """
         ops: list[IndexOp] = []
         to_ack: dict[int, list[tuple[FileId, int]]] = defaultdict(list)
@@ -348,11 +378,11 @@ class Gateway:
             return
         try:
             self._send_to_index(ops)
-        except _INDEX_UNAVAILABLE:
+            self._resolve(
+                [self._call(self._metadata[index], "ack", acks) for index, acks in to_ack.items()]
+            )
+        except ServiceUnavailable:
             return
-        self._resolve(
-            [self._call(self._metadata[index], "ack", acks) for index, acks in to_ack.items()]
-        )
 
     def _send_to_index(self, ops: Iterable[IndexOp]) -> None:
         """Entrega los cambios al índice, con una sola llamada por TagShard y todas a la vez.
@@ -380,12 +410,18 @@ class Gateway:
         Ray lo reinicia con el mismo handle, el actor nuevo se rellena desde los
         metadatos y Ray le repite las peticiones pendientes. Repetirlas es seguro:
         lookup solo lee y apply_many ignora los cambios que ya conoce.
+
+        Lanza ServiceUnavailable si el shard está muerto del todo o si tampoco
+        responde después de reiniciarlo.
         """
+        what = f"El shard de etiquetas {index}"
         try:
             return ray.get(refs, timeout=self._index_timeout)
         except GetTimeoutError:
             ray.kill(self._tags[index], no_restart=False)
-            return ray.get(refs, timeout=self._restart_timeout)
+            return _get(refs, self._restart_timeout, what)
+        except RayActorError as error:  # murió y Ray no lo va a reiniciar
+            raise ServiceUnavailable(f"{what} no responde") from error
 
     def _ask_every_tag_shard(self, method: str) -> list[Any]:
         """Hace la misma pregunta a todos los TagShard a la vez."""
@@ -403,7 +439,10 @@ class Gateway:
         return function.remote(*args) if self._remote else function(*args)
 
     def _resolve(self, result: Any) -> Any:
-        return ray.get(result) if self._remote else result
+        """Espera las respuestas de los shards de metadatos."""
+        if not self._remote:
+            return result
+        return _get(result, self._metadata_timeout, "Un shard de metadatos")
 
     def _metadata_for(self, file_id: FileId) -> Any:
         return self._metadata[self._metadata_index(file_id)]

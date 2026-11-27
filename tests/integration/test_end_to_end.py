@@ -16,7 +16,7 @@ from ray.exceptions import RayActorError
 
 from tagfs.content import ContentNotFound, StorageUnavailable, content_hash
 from tagfs.gateway import StoredFile
-from tagfs.model import FileNotFound, InvalidQuery, InvalidTag, normalize_tags
+from tagfs.model import FileNotFound, InvalidQuery, InvalidTag, ServiceUnavailable, normalize_tags
 from tagfs.query import matches, parse_query
 from tagfs.ray_runtime import run_in_workers, start_cluster
 
@@ -439,11 +439,11 @@ def test_metadata_shard_failure_loses_its_files():
         assert gateway.get(file_id).name.endswith(".txt")
         assert gateway.add_tags(file_id, {"sobrevive"}) == 2
     for file_id in lost:
-        with pytest.raises(RayActorError):
+        with pytest.raises(ServiceUnavailable):
             gateway.get(file_id)
-    with pytest.raises(RayActorError):
+    with pytest.raises(ServiceUnavailable):
         gateway.list()  # necesita preguntar a todos los shards
-    with pytest.raises(RayActorError):
+    with pytest.raises(ServiceUnavailable):
         gateway.query("doc")  # entre los candidatos hay archivos del shard caído
     assert gateway.query("sobrevive") == sorted(kept)
 
