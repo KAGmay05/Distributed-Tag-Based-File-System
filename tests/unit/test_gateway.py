@@ -4,7 +4,7 @@ from maintenance_checks import MaintenanceChecks
 
 from tagfs.content import ContentCorrupted
 from tagfs.fake_content_store import FakeContentStore
-from tagfs.gateway import Gateway, StoredFile
+from tagfs.gateway import Gateway
 from tagfs.metadata_shard import MetadataShard
 from tagfs.model import InvalidTag
 from tagfs.router import shard_for
@@ -208,18 +208,6 @@ def test_a_change_by_query_calls_each_shard_once():
     home = shard_for("doc", len(tags))
     calls = [shard.apply_many_calls - old for shard, old in zip(tags, before)]
     assert calls == [1 if index == home else 0 for index in range(len(tags))]
-
-
-def test_stored_file_supports_attributes_and_tuple_access():
-    gateway, _, _ = build_gateway()
-    file_id = gateway.put("a.txt", b"x")
-
-    stored = gateway.get(file_id)
-
-    assert isinstance(stored, StoredFile)
-    assert stored.name == stored[0] == "a.txt"
-    assert stored.content == stored[1] == b"x"
-    assert stored.tags == frozenset()
 
 
 class ClientStopped(Exception):

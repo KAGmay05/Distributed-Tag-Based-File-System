@@ -9,6 +9,10 @@ Como el contrato, cada implementación hereda MaintenanceChecks y aporta el
 fixture `gateway`.
 """
 
+import pytest
+
+from tagfs.content import ContentNotFound
+
 
 class MaintenanceChecks:
     def test_collect_garbage_removes_only_content_no_live_file_uses(self, gateway):
@@ -21,6 +25,16 @@ class MaintenanceChecks:
 
         assert gateway.collect_garbage() == 1  # b"solo"; b"igual" lo sigue usando second
         assert gateway.get(second).content == b"igual"
+
+    def test_collect_garbage_removes_content_left_by_a_failed_put(self, gateway):
+        # Un put que guardó el contenido y falló antes de crear la ficha deja bytes
+        # que ningún archivo usa. Se simula guardándolos directamente en el almacén.
+        key = gateway._content.put(b"huerfano")
+
+        assert gateway.collect_garbage() == 1
+
+        with pytest.raises(ContentNotFound):
+            gateway._content.get(key)
 
     def test_index_matches_metadata_after_every_kind_of_change(self, gateway):
         kept = gateway.put("a.txt", b"x", {"doc", "foto"})

@@ -1,4 +1,12 @@
-from tagfs.content import ContentCorrupted, ContentNotFound, content_hash
+import pytest
+
+from tagfs.content import (
+    ContentCorrupted,
+    ContentNotFound,
+    NodeUnreachable,
+    StorageUnavailable,
+    content_hash,
+)
 from tagfs.model import TagFSError
 
 
@@ -8,6 +16,8 @@ def test_known_value_of_empty_content():
     )
 
 
-def test_errors_belong_to_the_project_family():
-    assert issubclass(ContentNotFound, TagFSError)
-    assert issubclass(ContentCorrupted, TagFSError)
+@pytest.mark.parametrize(
+    "error", [ContentNotFound, ContentCorrupted, StorageUnavailable, NodeUnreachable]
+)
+def test_errors_belong_to_the_project_family(error):
+    assert issubclass(error, TagFSError)

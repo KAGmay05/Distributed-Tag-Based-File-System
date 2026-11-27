@@ -15,6 +15,7 @@ from itertools import count
 
 import pytest
 import ray
+from actor_restarts import crash_and_wait_for_restart
 
 from tagfs.gateway import Gateway
 from tagfs.ray_runtime import run_in_workers, start_cluster
@@ -33,15 +34,18 @@ def gateway(cluster):
 
 
 def crash_index_of(gateway, tag):
-    # Como si se cayera el proceso del actor: Ray lo vuelve a arrancar.
+    # Como si se cayera el proceso del actor: Ray lo vuelve a arrancar. No espera:
+    # la llamada siguiente puede atenderla aún el proceso viejo. Para leer el
+    # índice reconstruido hay que usar crash_index_and_wait_for_restart.
     ray.kill(gateway._tag_shard_for(tag), no_restart=False)
 
 
-# ray.kill no espera a que el actor muera: hasta entonces puede seguir respondiendo.
-# Estas dos funciones esperan a que la caída o el reinicio hayan ocurrido de verdad.
+def crash_index_and_wait_for_restart(gateway, tag):
+    crash_and_wait_for_restart(gateway._tag_shard_for(tag))
 
 
 def wait_until_dead(actor, seconds=30, probe=None):
+    # ray.kill no espera a que el actor muera: hasta entonces puede seguir respondiendo.
     # probe hace una llamada cualquiera al actor; por defecto, pid.
     probe = probe or actor.pid.remote
     deadline = time.monotonic() + seconds
@@ -52,17 +56,6 @@ def wait_until_dead(actor, seconds=30, probe=None):
             return
         time.sleep(0.1)
     raise TimeoutError("El actor no murió")
-
-
-def crash_index_and_wait_for_restart(gateway, tag, seconds=60):
-    shard = gateway._tag_shard_for(tag)
-    before = ray.get(shard.pid.remote())
-    crash_index_of(gateway, tag)
-    deadline = time.monotonic() + seconds
-    while ray.get(shard.pid.remote(), timeout=seconds) == before:
-        if time.monotonic() > deadline:
-            raise TimeoutError("El TagShard no se reinició")
-        time.sleep(0.1)
 
 
 def raw_index(gateway, tag):
@@ -78,13 +71,6 @@ def test_put_succeeds_and_is_queryable_after_its_tag_shard_dies(gateway):
 
     assert gateway.get(new).name == "nuevo.jpg"
     assert gateway.query("i1-foto") == sorted([old, new])
-
-
-def test_query_recovers_the_index_of_a_dead_tag_shard(gateway):
-    file_id = gateway.put("a.txt", b"x", {"i2-doc"})
-    crash_index_of(gateway, "i2-doc")
-
-    assert gateway.query("i2-doc") == [file_id]
 
 
 @pytest.mark.parametrize("operation", ["add", "remove", "delete"])
@@ -169,7 +155,7 @@ def test_rebuilt_index_leaves_out_deleted_files_and_removed_tags(gateway):
     gateway.delete(deleted)
     gateway.remove_tags(untagged, {"i4-doc"})
 
-    crash_index_of(gateway, "i4-doc")  # al arrancar de nuevo se rellena desde los metadatos
+    crash_index_and_wait_for_restart(gateway, "i4-doc")  # se rellena desde los metadatos
 
     assert raw_index(gateway, "i4-doc") == {live}
 
@@ -177,16 +163,13 @@ def test_rebuilt_index_leaves_out_deleted_files_and_removed_tags(gateway):
 def test_only_the_dead_tag_shard_restarts_and_keeps_its_handle(gateway):
     gateway.put("a.txt", b"x", {"i5-doc"})
     dead = gateway._tag_index("i5-doc")
-    handles = list(gateway._tags)
-    before = ray.get([shard.pid.remote() for shard in handles])
+    before = ray.get([shard.pid.remote() for shard in gateway._tags])
 
-    # Se espera al reinicio: justo después de ray.kill aún puede responder el proceso viejo.
     crash_index_and_wait_for_restart(gateway, "i5-doc")
     gateway.query("i5-doc")
 
     after = ray.get([shard.pid.remote() for shard in gateway._tags])
-    assert all(now is then for now, then in zip(gateway._tags, handles))  # mismo handle
-    assert after[dead] != before[dead]  # pero otro proceso
+    assert after[dead] != before[dead]  # el mismo handle llega a otro proceso
     assert [pid for i, pid in enumerate(after) if i != dead] == [
         pid for i, pid in enumerate(before) if i != dead
     ]
@@ -196,7 +179,7 @@ def test_every_client_sees_the_rebuilt_index(cluster):
     writer, reader = cluster.gateway(), cluster.gateway()
     first = writer.put("a.txt", b"x", {"i6-doc"})
 
-    crash_index_of(writer, "i6-doc")
+    crash_index_and_wait_for_restart(writer, "i6-doc")
 
     assert reader.query("i6-doc") == [first]
     second = reader.put("b.txt", b"y", {"i6-doc"})

@@ -28,5 +28,7 @@ def test_a_tag_must_be_text(tag):
 
 
 def test_bytes_are_not_a_collection_of_tags():
+    # b"foto" se recorre como los enteros 102, 111, 116, 111. Hoy se rechaza porque
+    # un entero no es una etiqueta; si eso cambiara, este test evita que se guarden.
     with pytest.raises(InvalidTag):
         normalize_tags(b"foto")

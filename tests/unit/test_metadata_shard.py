@@ -301,12 +301,14 @@ def test_matching_files_that_already_have_the_tag_keep_their_version(photos):
 @every_bulk_change
 def test_repeating_a_bulk_change_does_nothing_more(photos, method):
     change_matching(photos, method)
-    before = photos.live_files()
+    before = photos.live_files(), photos.pending()
 
     repeated = change_matching(photos, method)
 
-    assert photos.live_files() == before
-    assert all(ops == () for _, ops in repeated.values())
+    assert (photos.live_files(), photos.pending()) == before
+    # Tras borrar o quitar "foto", ningún archivo cumple ya la consulta. Tras agregar
+    # la siguen cumpliendo, pero sin cambio: misma versión y nada para el índice.
+    assert repeated == ({"f1": (2, ()), "f2": (2, ())} if method == "add_tags" else {})
 
 
 @every_bulk_change

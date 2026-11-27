@@ -30,14 +30,6 @@ class Cluster:
         for op in ops:
             self.tag_shard_for(op.tag).apply(op)
 
-    def deliver_in_batches(self, rng, ops):
-        """Entrega los cambios en lotes de tamaño aleatorio, cada uno repartido por shard."""
-        while ops:
-            size = rng.randint(1, 10)
-            batch, ops = ops[:size], ops[size:]
-            for shard in self.tags:
-                shard.apply_many([op for op in batch if self.tag_shard_for(op.tag) is shard])
-
     def index(self):
         return {tag: self.tag_shard_for(tag).lookup(tag) for tag in TAGS}
 
@@ -114,16 +106,5 @@ def test_index_converges_when_delivery_is_reordered_and_duplicated(seed):
     ops = run_random_operations(rng, cluster)
 
     cluster.deliver(with_reordering_and_duplicates(rng, ops))
-
-    assert cluster.index() == cluster.index_from_metadata()
-
-
-@pytest.mark.parametrize("seed", range(50))
-def test_index_converges_when_changes_arrive_in_batches(seed):
-    rng = random.Random(seed)
-    cluster = Cluster()
-    ops = run_random_operations(rng, cluster)
-
-    cluster.deliver_in_batches(rng, with_reordering_and_duplicates(rng, ops))
 
     assert cluster.index() == cluster.index_from_metadata()

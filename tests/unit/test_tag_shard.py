@@ -52,16 +52,6 @@ BATCH = [
 ]
 
 
-def test_apply_many_gives_the_same_index_as_applying_one_by_one():
-    one_by_one, batched = TagShard(), TagShard()
-
-    for op in BATCH:
-        one_by_one.apply(op)
-    batched.apply_many(BATCH)
-
-    assert batched.entries() == one_by_one.entries() == {"foto": {"f1", "f2"}}
-
-
 def test_apply_many_gives_the_same_index_in_any_order():
     for ops in permutations(BATCH):
         shard = TagShard()

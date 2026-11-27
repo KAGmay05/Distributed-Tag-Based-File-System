@@ -11,6 +11,7 @@ import time
 
 import pytest
 import ray
+from actor_restarts import crash_and_wait_for_restart
 from ray.exceptions import RayActorError
 
 from tagfs.content import ContentNotFound, StorageUnavailable, content_hash
@@ -202,8 +203,8 @@ def test_full_life_of_the_system_survives_failures():
     nuevo = gateway.put("nuevo.txt", b"bytes nuevos", {"texto"})
     assert gateway.get(nuevo).content == b"bytes nuevos"
 
-    # 4. Muere la sección del índice que guarda "foto": Ray la reinicia.
-    ray.kill(gateway._tag_shard_for("foto"), no_restart=False)
+    # 4. Muere la sección del índice que guarda "foto": Ray la reinicia y la rellena.
+    crash_and_wait_for_restart(gateway._tag_shard_for("foto"))
 
     assert gateway.query("foto") == sorted([playa, copia])
     gateway.add_tags(nuevo, {"foto"})
